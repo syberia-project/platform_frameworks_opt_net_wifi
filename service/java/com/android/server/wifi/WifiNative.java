@@ -74,21 +74,22 @@ public class WifiNative {
     private final HostapdHal mHostapdHal;
     private final WifiVendorHal mWifiVendorHal;
     private final WificondControl mWificondControl;
+    private final WifiMonitor mWifiMonitor;
     private final INetworkManagementService mNwManagementService;
     private final PropertyService mPropertyService;
     private final WifiMetrics mWifiMetrics;
     private boolean mVerboseLoggingEnabled = false;
 
-    // TODO(b/69426063): Remove interfaceName from constructor once WifiStateMachine switches over
-    // to the new interface management methods.
     public WifiNative(WifiVendorHal vendorHal,
                       SupplicantStaIfaceHal staIfaceHal, HostapdHal hostapdHal,
-                      WificondControl condControl, INetworkManagementService nwService,
+                      WificondControl condControl, WifiMonitor wifiMonitor,
+                      INetworkManagementService nwService,
                       PropertyService propertyService, WifiMetrics wifiMetrics) {
         mWifiVendorHal = vendorHal;
         mSupplicantStaIfaceHal = staIfaceHal;
         mHostapdHal = hostapdHal;
         mWificondControl = condControl;
+        mWifiMonitor = wifiMonitor;
         mNwManagementService = nwService;
         mPropertyService = propertyService;
         mWifiMetrics = wifiMetrics;
@@ -391,6 +392,7 @@ public class WifiNative {
     /** Helper method invoked to teardown client iface and perform necessary cleanup */
     private void onClientInterfaceDestroyed(@NonNull Iface iface) {
         synchronized (mLock) {
+            mWifiMonitor.stopMonitoring(iface.name);
             if (!unregisterNetworkObserver(iface.networkObserver)) {
                 Log.e(TAG, "Failed to unregister network observer on " + iface);
             }
@@ -557,6 +559,11 @@ public class WifiNative {
                 iface.externalListener.onUp(iface.name);
             } else {
                 iface.externalListener.onDown(iface.name);
+                if (iface.type == Iface.IFACE_TYPE_STA) {
+                    mWifiMetrics.incrementNumClientInterfaceDown();
+                } else if (iface.type == Iface.IFACE_TYPE_AP) {
+                    mWifiMetrics.incrementNumSoftApInterfaceDown();
+                }
             }
             iface.isUp = isUp;
         }
@@ -574,13 +581,22 @@ public class WifiNative {
         }
 
         // TODO(b/76219766): We may need to listen for link state changes in SoftAp mode.
+        /**
+         * Note: We should ideally listen to
+         * {@link BaseNetworkObserver#interfaceStatusChanged(String, boolean)} here. But, that
+         * callback is not working currently (broken in netd). So, instead listen to link state
+         * change callbacks as triggers to query the real interface state. We should get rid of
+         * this workaround if we get the |interfaceStatusChanged| callback to work in netd.
+         * Also, this workaround will not detect an interface up event, if the link state is
+         * still down.
+         */
         @Override
-        public void interfaceStatusChanged(String ifaceName, boolean isUp) {
+        public void interfaceLinkStateChanged(String ifaceName, boolean unusedIsLinkUp) {
             synchronized (mLock) {
                 final Iface ifaceWithId = mIfaceMgr.getIface(mInterfaceId);
                 if (ifaceWithId == null) {
                     if (mVerboseLoggingEnabled) {
-                        Log.v(TAG, "Received iface up/down notification on an invalid iface="
+                        Log.v(TAG, "Received iface link up/down notification on an invalid iface="
                                 + mInterfaceId);
                     }
                     return;
@@ -588,12 +604,12 @@ public class WifiNative {
                 final Iface ifaceWithName = mIfaceMgr.getIface(ifaceName);
                 if (ifaceWithName == null || ifaceWithName != ifaceWithId) {
                     if (mVerboseLoggingEnabled) {
-                        Log.v(TAG, "Received iface up/down notification on an invalid iface="
+                        Log.v(TAG, "Received iface link up/down notification on an invalid iface="
                                 + ifaceName);
                     }
                     return;
                 }
-                onInterfaceStateChanged(ifaceWithName, isUp);
+                onInterfaceStateChanged(ifaceWithName, isInterfaceUp(ifaceName));
             }
         }
     }
@@ -796,12 +812,12 @@ public class WifiNative {
         synchronized (mLock) {
             if (!startHal()) {
                 Log.e(TAG, "Failed to start Hal");
-                mWifiMetrics.incrementNumWifiOnFailureDueToHal();
+                mWifiMetrics.incrementNumSetupClientInterfaceFailureDueToHal();
                 return null;
             }
             if (!startSupplicant()) {
                 Log.e(TAG, "Failed to start supplicant");
-                mWifiMetrics.incrementNumWifiOnFailureDueToSupplicant();
+                mWifiMetrics.incrementNumSetupClientInterfaceFailureDueToSupplicant();
                 return null;
             }
             Iface iface = mIfaceMgr.allocateIface(Iface.IFACE_TYPE_STA);
@@ -814,19 +830,19 @@ public class WifiNative {
             if (TextUtils.isEmpty(iface.name)) {
                 Log.e(TAG, "Failed to create STA iface in vendor HAL");
                 mIfaceMgr.removeIface(iface.id);
-                mWifiMetrics.incrementNumWifiOnFailureDueToHal();
+                mWifiMetrics.incrementNumSetupClientInterfaceFailureDueToHal();
                 return null;
             }
             if (mWificondControl.setupInterfaceForClientMode(iface.name) == null) {
                 Log.e(TAG, "Failed to setup iface in wificond on " + iface);
                 teardownInterface(iface.name);
-                mWifiMetrics.incrementNumWifiOnFailureDueToWificond();
+                mWifiMetrics.incrementNumSetupClientInterfaceFailureDueToWificond();
                 return null;
             }
             if (!mSupplicantStaIfaceHal.setupIface(iface.name)) {
                 Log.e(TAG, "Failed to setup iface in supplicant on " + iface);
                 teardownInterface(iface.name);
-                mWifiMetrics.incrementNumWifiOnFailureDueToSupplicant();
+                mWifiMetrics.incrementNumSetupClientInterfaceFailureDueToSupplicant();
                 return null;
             }
             iface.networkObserver = new NetworkObserverInternal(iface.id);
@@ -835,6 +851,7 @@ public class WifiNative {
                 teardownInterface(iface.name);
                 return null;
             }
+            mWifiMonitor.startMonitoring(iface.name);
             // Just to avoid any race conditions with interface state change callbacks,
             // update the interface state before we exit.
             onInterfaceStateChanged(iface, isInterfaceUp(iface.name));
@@ -857,7 +874,7 @@ public class WifiNative {
         synchronized (mLock) {
             if (!startHal()) {
                 Log.e(TAG, "Failed to start Hal");
-                mWifiMetrics.incrementNumWifiOnFailureDueToHal();
+                mWifiMetrics.incrementNumSetupSoftApInterfaceFailureDueToHal();
                 return null;
             }
             Iface iface = mIfaceMgr.allocateIface(Iface.IFACE_TYPE_AP);
@@ -870,15 +887,13 @@ public class WifiNative {
             if (TextUtils.isEmpty(iface.name)) {
                 Log.e(TAG, "Failed to create AP iface in vendor HAL");
                 mIfaceMgr.removeIface(iface.id);
-                // TODO(b/68716726): Separate SoftAp metrics
-                mWifiMetrics.incrementNumWifiOnFailureDueToHal();
+                mWifiMetrics.incrementNumSetupSoftApInterfaceFailureDueToHal();
                 return null;
             }
             if (mWificondControl.setupInterfaceForSoftApMode(iface.name) == null) {
                 Log.e(TAG, "Failed to setup iface in wificond on " + iface);
                 teardownInterface(iface.name);
-                // TODO(b/68716726): Separate SoftAp metrics
-                mWifiMetrics.incrementNumWifiOnFailureDueToWificond();
+                mWifiMetrics.incrementNumSetupSoftApInterfaceFailureDueToWificond();
                 return null;
             }
             iface.networkObserver = new NetworkObserverInternal(iface.id);
@@ -896,6 +911,7 @@ public class WifiNative {
     }
 
     /**
+     *
      * Check if the interface is up or down.
      *
      * @param ifaceName Name of the interface.
@@ -1198,18 +1214,22 @@ public class WifiNative {
             @NonNull String ifaceName, WifiConfiguration config, SoftApListener listener) {
         if (!mWificondControl.startHostapd(ifaceName, listener)) {
             Log.e(TAG, "Failed to start hostapd");
+            mWifiMetrics.incrementNumSetupSoftApInterfaceFailureDueToHostapd();
             return false;
         }
         if (!waitForHostapdConnection()) {
             Log.e(TAG, "Failed to establish connection to hostapd");
+            mWifiMetrics.incrementNumSetupSoftApInterfaceFailureDueToHostapd();
             return false;
         }
         if (!mHostapdHal.registerDeathHandler(new HostapdDeathHandlerInternal())) {
             Log.e(TAG, "Failed to register hostapd death handler");
+            mWifiMetrics.incrementNumSetupSoftApInterfaceFailureDueToHostapd();
             return false;
         }
         if (!mHostapdHal.addAccessPoint(ifaceName, config)) {
             Log.e(TAG, "Failed to add acccess point");
+            mWifiMetrics.incrementNumSetupSoftApInterfaceFailureDueToHostapd();
             return false;
         }
         return true;
@@ -1236,7 +1256,7 @@ public class WifiNative {
      */
     public boolean setMacAddress(String interfaceName, MacAddress mac) {
         // TODO(b/72459123): Suppress interface down/up events from this call
-        return mWificondControl.setMacAddress(interfaceName, mac);
+        return mWifiVendorHal.setMacAddress(interfaceName, mac);
     }
 
     /********************************************************
@@ -2175,12 +2195,22 @@ public class WifiNative {
     /**
      * Installs an APF program on this iface, replacing any existing program.
      *
-     * @param ifaceName Name of the interface.
+     * @param ifaceName Name of the interface
      * @param filter is the android packet filter program
      * @return true for success
      */
     public boolean installPacketFilter(@NonNull String ifaceName, byte[] filter) {
         return mWifiVendorHal.installPacketFilter(ifaceName, filter);
+    }
+
+    /**
+     * Reads the APF program and data buffer for this iface.
+     *
+     * @param ifaceName Name of the interface
+     * @return the buffer returned by the driver, or null in case of an error
+     */
+    public byte[] readPacketFilter(@NonNull String ifaceName) {
+        return mWifiVendorHal.readPacketFilter(ifaceName);
     }
 
     /**

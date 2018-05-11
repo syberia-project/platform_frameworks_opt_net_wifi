@@ -63,10 +63,10 @@ import android.content.IntentFilter;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.res.Resources;
-import android.net.IpConfiguration;
 import android.net.wifi.ISoftApCallback;
 import android.net.wifi.ScanResult;
 import android.net.wifi.WifiConfiguration;
+import android.net.wifi.WifiConfiguration.KeyMgmt;
 import android.net.wifi.WifiEnterpriseConfig;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
@@ -309,6 +309,8 @@ public class WifiServiceImplTest {
         // Create an OSU provider that can be provisioned via an open OSU AP
         mOsuProvider = PasspointProvisioningTestUtil.generateOsuProvider(true);
         when(mContext.getOpPackageName()).thenReturn(TEST_PACKAGE_NAME);
+        when(mContext.checkPermission(eq(android.Manifest.permission.NETWORK_SETTINGS),
+                anyInt(), anyInt())).thenReturn(PackageManager.PERMISSION_DENIED);
 
         ArgumentCaptor<SoftApCallback> softApCallbackCaptor =
                 ArgumentCaptor.forClass(SoftApCallback.class);
@@ -351,24 +353,6 @@ public class WifiServiceImplTest {
     }
 
     /**
-     * Tests the isValid() check for StaticIpConfigurations, ensuring that configurations with null
-     * ipAddress are rejected, and configurations with ipAddresses are valid.
-     */
-    @Test
-    public void testStaticIpConfigurationValidityCheck() {
-        WifiConfiguration conf = WifiConfigurationTestUtil.createOpenNetwork();
-        IpConfiguration ipConf =
-                WifiConfigurationTestUtil.createStaticIpConfigurationWithStaticProxy();
-        conf.setIpConfiguration(ipConf);
-        // Ensure staticIpConfiguration with IP Address is valid
-        assertTrue(mWifiServiceImpl.isValid(conf));
-        ipConf.staticIpConfiguration.ipAddress = null;
-        // Ensure staticIpConfiguration with null IP Address it is not valid
-        conf.setIpConfiguration(ipConf);
-        assertFalse(mWifiServiceImpl.isValid(conf));
-    }
-
-    /**
      * Ensure WifiMetrics.dump() is the only dump called when 'dumpsys wifi WifiMetricsProto' is
      * called. This is required to support simple metrics collection via dumpsys
      */
@@ -381,7 +365,6 @@ public class WifiServiceImplTest {
         verify(mWifiStateMachine, never())
                 .dump(any(FileDescriptor.class), any(PrintWriter.class), any(String[].class));
     }
-
 
     /**
      * Ensure WifiServiceImpl.dump() doesn't throw an NPE when executed with null args
@@ -419,26 +402,36 @@ public class WifiServiceImplTest {
      * Verify a SecurityException is thrown if a caller does not have the correct permission to
      * toggle wifi.
      */
-    @Test(expected = SecurityException.class)
+    @Test
     public void testSetWifiEnableWithoutPermission() throws Exception {
         doThrow(new SecurityException()).when(mContext)
                 .enforceCallingOrSelfPermission(eq(android.Manifest.permission.CHANGE_WIFI_STATE),
                                                 eq("WifiService"));
         when(mSettingsStore.isAirplaneModeOn()).thenReturn(false);
-        mWifiServiceImpl.setWifiEnabled(TEST_PACKAGE_NAME, true);
+        try {
+            mWifiServiceImpl.setWifiEnabled(TEST_PACKAGE_NAME, true);
+            fail();
+        } catch (SecurityException e) {
+
+        }
+
     }
 
     /**
      * Verify a SecurityException is thrown if OPSTR_CHANGE_WIFI_STATE is disabled for the app.
      */
-    @Test(expected = SecurityException.class)
+    @Test
     public void testSetWifiEnableAppOpsRejected() throws Exception {
         when(mSettingsStore.handleWifiToggled(eq(true))).thenReturn(true);
         doThrow(new SecurityException()).when(mAppOpsManager)
                 .noteOp(AppOpsManager.OPSTR_CHANGE_WIFI_STATE, Process.myUid(), TEST_PACKAGE_NAME);
-
         when(mSettingsStore.isAirplaneModeOn()).thenReturn(false);
-        mWifiServiceImpl.setWifiEnabled(TEST_PACKAGE_NAME, true);
+        try {
+            mWifiServiceImpl.setWifiEnabled(TEST_PACKAGE_NAME, true);
+            fail();
+        } catch (SecurityException e) {
+
+        }
         verify(mWifiController, never()).sendMessage(eq(CMD_WIFI_TOGGLED));
     }
 
@@ -806,8 +799,9 @@ public class WifiServiceImplTest {
     @Test
     public void testSetWifiApConfigurationSuccess() {
         when(mWifiPermissionsUtil.checkConfigOverridePermission(anyInt())).thenReturn(true);
-        WifiConfiguration apConfig = new WifiConfiguration();
-        mWifiServiceImpl.setWifiApConfiguration(apConfig, TEST_PACKAGE_NAME);
+        WifiConfiguration apConfig = createValidSoftApConfiguration();
+
+        assertTrue(mWifiServiceImpl.setWifiApConfiguration(apConfig, TEST_PACKAGE_NAME));
         mLooper.dispatchAll();
         verifyCheckChangePermission(TEST_PACKAGE_NAME);
         verify(mWifiApConfigStore).setApConfiguration(eq(apConfig));
@@ -819,8 +813,19 @@ public class WifiServiceImplTest {
     @Test
     public void testSetWifiApConfigurationNullConfigNotSaved() {
         when(mWifiPermissionsUtil.checkConfigOverridePermission(anyInt())).thenReturn(true);
-        mWifiServiceImpl.setWifiApConfiguration(null, TEST_PACKAGE_NAME);
+        assertFalse(mWifiServiceImpl.setWifiApConfiguration(null, TEST_PACKAGE_NAME));
         verify(mWifiApConfigStore, never()).setApConfiguration(isNull(WifiConfiguration.class));
+    }
+
+    /**
+     * Ensure that an invalid config does not overwrite the saved ap config.
+     */
+    @Test
+    public void testSetWifiApConfigurationWithInvalidConfigNotSaved() {
+        when(mWifiPermissionsUtil.checkConfigOverridePermission(anyInt())).thenReturn(true);
+        assertFalse(mWifiServiceImpl.setWifiApConfiguration(new WifiConfiguration(),
+                                                            TEST_PACKAGE_NAME));
+        verify(mWifiApConfigStore, never()).setApConfiguration(any());
     }
 
     /**
@@ -974,7 +979,7 @@ public class WifiServiceImplTest {
      */
     @Test
     public void testStartSoftApWithPermissionsAndValidConfig() {
-        WifiConfiguration config = new WifiConfiguration();
+        WifiConfiguration config = createValidSoftApConfiguration();
         boolean result = mWifiServiceImpl.startSoftAp(config);
         assertTrue(result);
         verify(mWifiController)
@@ -1049,7 +1054,8 @@ public class WifiServiceImplTest {
     public void testConnectedIdsAreHiddenFromAppWithoutPermission() throws Exception {
         setupForGetConnectionInfo();
 
-        when(mWifiPermissionsUtil.canAccessScanResults(anyString(), anyInt())).thenReturn(false);
+        doThrow(new SecurityException()).when(mWifiPermissionsUtil).enforceCanAccessScanResults(
+                anyString(), anyInt());
 
         WifiInfo connectionInfo = mWifiServiceImpl.getConnectionInfo(TEST_PACKAGE);
 
@@ -1059,14 +1065,14 @@ public class WifiServiceImplTest {
 
     /**
      * Test that connected SSID and BSSID are not exposed to an app that does not have the
-     * appropriate permissions, when canAccessScanResults raises a SecurityException.
+     * appropriate permissions, when enforceCanAccessScanResults raises a SecurityException.
      */
     @Test
     public void testConnectedIdsAreHiddenOnSecurityException() throws Exception {
         setupForGetConnectionInfo();
 
-        when(mWifiPermissionsUtil.canAccessScanResults(anyString(), anyInt()))
-                .thenThrow(new SecurityException());
+        doThrow(new SecurityException()).when(mWifiPermissionsUtil).enforceCanAccessScanResults(
+                anyString(), anyInt());
 
         WifiInfo connectionInfo = mWifiServiceImpl.getConnectionInfo(TEST_PACKAGE);
 
@@ -1081,8 +1087,6 @@ public class WifiServiceImplTest {
     @Test
     public void testConnectedIdsAreVisibleFromPermittedApp() throws Exception {
         setupForGetConnectionInfo();
-
-        when(mWifiPermissionsUtil.canAccessScanResults(anyString(), anyInt())).thenReturn(true);
 
         WifiInfo connectionInfo = mWifiServiceImpl.getConnectionInfo(TEST_PACKAGE);
 
@@ -1105,7 +1109,6 @@ public class WifiServiceImplTest {
         when(mScanRequestProxy.getScanResults()).thenReturn(scanResultList);
 
         String packageName = "test.com";
-        when(mWifiPermissionsUtil.canAccessScanResults(eq(packageName), anyInt())).thenReturn(true);
         List<ScanResult> retrievedScanResultList = mWifiServiceImpl.getScanResults(packageName);
         verify(mScanRequestProxy).getScanResults();
 
@@ -1131,7 +1134,6 @@ public class WifiServiceImplTest {
         when(mScanRequestProxy.getScanResults()).thenReturn(scanResultList);
 
         String packageName = "test.com";
-        when(mWifiPermissionsUtil.canAccessScanResults(eq(packageName), anyInt())).thenReturn(true);
         List<ScanResult> retrievedScanResultList = mWifiServiceImpl.getScanResults(packageName);
         verify(mScanRequestProxy, never()).getScanResults();
 
@@ -2544,6 +2546,55 @@ public class WifiServiceImplTest {
         verify(mScanRequestProxy).startScan(Process.myUid(), SCAN_PACKAGE_NAME);
     }
 
+    /**
+     * Verify that if the caller has NETWORK_SETTINGS permission, then it doesn't need
+     * CHANGE_WIFI_STATE permission.
+     * @throws Exception
+     */
+    @Test
+    public void testDisconnectWithNetworkSettingsPerm() throws Exception {
+        when(mContext.checkPermission(eq(android.Manifest.permission.NETWORK_SETTINGS),
+                anyInt(), anyInt())).thenReturn(PackageManager.PERMISSION_GRANTED);
+        doThrow(new SecurityException()).when(mContext).enforceCallingOrSelfPermission(
+                android.Manifest.permission.CHANGE_WIFI_STATE, "WifiService");
+        doThrow(new SecurityException()).when(mAppOpsManager)
+                .noteOp(AppOpsManager.OPSTR_CHANGE_WIFI_STATE, Process.myUid(), TEST_PACKAGE_NAME);
+        mWifiServiceImpl.disconnect(TEST_PACKAGE_NAME);
+        verify(mWifiStateMachine).disconnectCommand();
+    }
+
+    /**
+     * Verify that if the caller doesn't have NETWORK_SETTINGS permission, it could still
+     * get access with the CHANGE_WIFI_STATE permission.
+     * @throws Exception
+     */
+    @Test
+    public void testDisconnectWithChangeWifiStatePerm() throws Exception {
+        mWifiServiceImpl.disconnect(TEST_PACKAGE_NAME);
+        verifyCheckChangePermission(TEST_PACKAGE_NAME);
+        verify(mWifiStateMachine).disconnectCommand();
+    }
+
+    /**
+     * Verify that the operation fails if the caller has neither NETWORK_SETTINGS or
+     * CHANGE_WIFI_STATE permissions.
+     * @throws Exception
+     */
+    @Test
+    public void testDisconnectRejected() throws Exception {
+        doThrow(new SecurityException()).when(mAppOpsManager)
+                .noteOp(AppOpsManager.OPSTR_CHANGE_WIFI_STATE, Process.myUid(), TEST_PACKAGE_NAME);
+        try {
+            mWifiServiceImpl.disconnect(TEST_PACKAGE_NAME);
+            fail();
+        } catch (SecurityException e) {
+
+        }
+        verifyCheckChangePermission(TEST_PACKAGE_NAME);
+        verify(mWifiStateMachine, never()).disconnectCommand();
+    }
+
+
     private class IdleModeIntentMatcher implements ArgumentMatcher<IntentFilter> {
         @Override
         public boolean matches(IntentFilter filter) {
@@ -2551,10 +2602,27 @@ public class WifiServiceImplTest {
         }
     }
 
+    /**
+     * Verifies that enforceChangePermission(String package) is called and the caller doesn't
+     * have NETWORK_SETTINGS permission
+     */
     private void verifyCheckChangePermission(String callingPackageName) {
+        verify(mContext, atLeastOnce())
+                .checkPermission(eq(android.Manifest.permission.NETWORK_SETTINGS),
+                        anyInt(), anyInt());
         verify(mContext, atLeastOnce()).enforceCallingOrSelfPermission(
                 android.Manifest.permission.CHANGE_WIFI_STATE, "WifiService");
         verify(mAppOpsManager, atLeastOnce()).noteOp(
                 AppOpsManager.OPSTR_CHANGE_WIFI_STATE, Process.myUid(), callingPackageName);
+    }
+
+    private WifiConfiguration createValidSoftApConfiguration() {
+        WifiConfiguration apConfig = new WifiConfiguration();
+        apConfig.SSID = "TestAp";
+        apConfig.preSharedKey = "thisIsABadPassword";
+        apConfig.allowedKeyManagement.set(KeyMgmt.WPA2_PSK);
+        apConfig.apBand = WifiConfiguration.AP_BAND_2GHZ;
+
+        return apConfig;
     }
 }
