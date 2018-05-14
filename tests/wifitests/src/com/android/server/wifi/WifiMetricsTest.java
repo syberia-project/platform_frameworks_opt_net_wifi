@@ -45,6 +45,7 @@ import com.android.server.wifi.nano.WifiMetricsProto.PnoScanMetrics;
 import com.android.server.wifi.nano.WifiMetricsProto.SoftApConnectedClientsEvent;
 import com.android.server.wifi.nano.WifiMetricsProto.StaEvent;
 import com.android.server.wifi.nano.WifiMetricsProto.WpsMetrics;
+import com.android.server.wifi.rtt.RttMetrics;
 
 import org.junit.Before;
 import org.junit.Test;
@@ -82,7 +83,7 @@ public class WifiMetricsTest {
         when(mClock.getElapsedSinceBootMillis()).thenReturn((long) 0);
         mTestLooper = new TestLooper();
         mWifiMetrics = new WifiMetrics(mClock, mTestLooper.getLooper(),
-                new WifiAwareMetrics(mClock));
+                new WifiAwareMetrics(mClock), new RttMetrics(mClock));
         mWifiMetrics.setWifiConfigManager(mWcm);
         mWifiMetrics.setPasspointManager(mPpm);
         mWifiMetrics.setWifiNetworkSelector(mWns);
@@ -228,6 +229,7 @@ public class WifiMetricsTest {
     private static final int NUM_LAST_RESORT_WATCHDOG_TRIGGERS_WITH_BAD_DHCP = 9;
     private static final int NUM_LAST_RESORT_WATCHDOG_TRIGGERS_WITH_BAD_OTHER = 10;
     private static final int NUM_LAST_RESORT_WATCHDOG_SUCCESSES = 5;
+    private static final int WATCHDOG_TOTAL_CONNECTION_FAILURE_COUNT_AFTER_TRIGGER = 6;
     private static final int NUM_RSSI_LEVELS_TO_INCREMENT = 20;
     private static final int FIRST_RSSI_LEVEL = -80;
     private static final int NUM_OPEN_NETWORK_SCAN_RESULTS = 1;
@@ -238,6 +240,9 @@ public class WifiMetricsTest {
     private static final int NUM_HOTSPOT2_R2_NETWORK_SCAN_RESULTS = 2;
     private static final int NUM_SCANS = 5;
     private static final int NUM_CONNECTIVITY_ONESHOT_SCAN_EVENT = 4;
+    private static final int NUM_EXTERNAL_APP_ONESHOT_SCAN_REQUESTS = 15;
+    private static final int NUM_EXTERNAL_FOREGROUND_APP_ONESHOT_SCAN_REQUESTS_THROTTLED = 10;
+    private static final int NUM_EXTERNAL_BACKGROUND_APP_ONESHOT_SCAN_REQUESTS_THROTTLED = 16;
     private static final int NUM_TOTAL_SCAN_RESULTS = 8;
     private static final int MIN_RSSI_LEVEL = -127;
     private static final int MAX_RSSI_LEVEL = 0;
@@ -251,8 +256,16 @@ public class WifiMetricsTest {
     private static final int NUM_SOFTAP_FAILED_NO_CHANNEL = 1;
     private static final int NUM_HAL_CRASHES = 11;
     private static final int NUM_WIFICOND_CRASHES = 12;
+    private static final int NUM_SUPPLICANT_CRASHES = 23;
+    private static final int NUM_HOSTAPD_CRASHES = 7;
     private static final int NUM_WIFI_ON_FAILURE_DUE_TO_HAL = 13;
     private static final int NUM_WIFI_ON_FAILURE_DUE_TO_WIFICOND = 14;
+    private static final int NUM_WIFI_ON_FAILURE_DUE_TO_SUPPLICANT = 20;
+    private static final int NUM_SOFTAP_ON_FAILURE_DUE_TO_HAL = 23;
+    private static final int NUM_SOFTAP_ON_FAILURE_DUE_TO_WIFICOND = 19;
+    private static final int NUM_SOFTAP_ON_FAILURE_DUE_TO_HOSTAPD = 31;
+    private static final int NUM_SOFTAP_INTERFACE_DOWN = 65;
+    private static final int NUM_CLIENT_INTERFACE_DOWN = 12;
     private static final int NUM_PASSPOINT_PROVIDERS = 4;
     private static final int NUM_PASSPOINT_PROVIDER_INSTALLATION = 5;
     private static final int NUM_PASSPOINT_PROVIDER_INSTALL_SUCCESS = 4;
@@ -273,6 +286,7 @@ public class WifiMetricsTest {
     private static final int NUM_WPS_OTHER_CONNECTION_FAILURE = 16;
     private static final int NUM_WPS_SUPPLICANT_FAILURE = 12;
     private static final int NUM_WPS_CANCELLATION = 11;
+    private static final long NUM_WATCHDOG_SUCCESS_DURATION_MS = 65;
 
     /** Number of notifications per "Connect to Network" notification type. */
     private static final int[] NUM_CONNECT_TO_NETWORK_NOTIFICATIONS = {0, 10, 20, 30, 40};
@@ -332,7 +346,7 @@ public class WifiMetricsTest {
     }
 
     private ScanDetail buildMockScanDetailPasspoint(String ssid, String bssid, long hessid,
-            int anqpDomainId, NetworkDetail.HSRelease hsRelease) {
+            int anqpDomainId, NetworkDetail.HSRelease hsRelease, boolean weakSignal) {
         ScanDetail mockScanDetail = mock(ScanDetail.class);
         NetworkDetail mockNetworkDetail = mock(NetworkDetail.class);
         ScanResult scanResult = new ScanResult();
@@ -345,6 +359,7 @@ public class WifiMetricsTest {
         when(mockNetworkDetail.getHSRelease()).thenReturn(hsRelease);
         when(mockNetworkDetail.getAnqpDomainID()).thenReturn(anqpDomainId);
         when(mockNetworkDetail.isInterworking()).thenReturn(true);
+        when(mWns.isSignalTooWeak(eq(scanResult))).thenReturn(weakSignal);
         return mockScanDetail;
     }
 
@@ -462,6 +477,9 @@ public class WifiMetricsTest {
         for (int i = 0; i < NUM_LAST_RESORT_WATCHDOG_SUCCESSES; i++) {
             mWifiMetrics.incrementNumLastResortWatchdogSuccesses();
         }
+        for (int i = 0; i < WATCHDOG_TOTAL_CONNECTION_FAILURE_COUNT_AFTER_TRIGGER; i++) {
+            mWifiMetrics.incrementWatchdogTotalConnectionFailureCountAfterTrigger();
+        }
         for (int i = 0; i < NUM_RSSI_LEVELS_TO_INCREMENT; i++) {
             for (int j = 0; j <= i; j++) {
                 mWifiMetrics.incrementRssiPollRssiCount(MIN_RSSI_LEVEL + i);
@@ -489,7 +507,15 @@ public class WifiMetricsTest {
         for (int i = 0; i < NUM_CONNECTIVITY_ONESHOT_SCAN_EVENT; i++) {
             mWifiMetrics.incrementConnectivityOneshotScanCount();
         }
-
+        for (int i = 0; i < NUM_EXTERNAL_APP_ONESHOT_SCAN_REQUESTS; i++) {
+            mWifiMetrics.incrementExternalAppOneshotScanRequestsCount();
+        }
+        for (int i = 0; i < NUM_EXTERNAL_FOREGROUND_APP_ONESHOT_SCAN_REQUESTS_THROTTLED; i++) {
+            mWifiMetrics.incrementExternalForegroundAppOneshotScanRequestsThrottledCount();
+        }
+        for (int i = 0; i < NUM_EXTERNAL_BACKGROUND_APP_ONESHOT_SCAN_REQUESTS_THROTTLED; i++) {
+            mWifiMetrics.incrementExternalBackgroundAppOneshotScanRequestsThrottledCount();
+        }
         for (int score = WIFI_SCORE_RANGE_MIN; score < NUM_WIFI_SCORES_TO_INCREMENT; score++) {
             for (int offset = 0; offset <= score; offset++) {
                 mWifiMetrics.incrementWifiScoreCount(WIFI_SCORE_RANGE_MIN + score);
@@ -519,11 +545,35 @@ public class WifiMetricsTest {
         for (int i = 0; i < NUM_WIFICOND_CRASHES; i++) {
             mWifiMetrics.incrementNumWificondCrashes();
         }
+        for (int i = 0; i < NUM_SUPPLICANT_CRASHES; i++) {
+            mWifiMetrics.incrementNumSupplicantCrashes();
+        }
+        for (int i = 0; i < NUM_HOSTAPD_CRASHES; i++) {
+            mWifiMetrics.incrementNumHostapdCrashes();
+        }
         for (int i = 0; i < NUM_WIFI_ON_FAILURE_DUE_TO_HAL; i++) {
-            mWifiMetrics.incrementNumWifiOnFailureDueToHal();
+            mWifiMetrics.incrementNumSetupClientInterfaceFailureDueToHal();
         }
         for (int i = 0; i < NUM_WIFI_ON_FAILURE_DUE_TO_WIFICOND; i++) {
-            mWifiMetrics.incrementNumWifiOnFailureDueToWificond();
+            mWifiMetrics.incrementNumSetupClientInterfaceFailureDueToWificond();
+        }
+        for (int i = 0; i < NUM_WIFI_ON_FAILURE_DUE_TO_SUPPLICANT; i++) {
+            mWifiMetrics.incrementNumSetupClientInterfaceFailureDueToSupplicant();
+        }
+        for (int i = 0; i < NUM_SOFTAP_ON_FAILURE_DUE_TO_HAL; i++) {
+            mWifiMetrics.incrementNumSetupSoftApInterfaceFailureDueToHal();
+        }
+        for (int i = 0; i < NUM_SOFTAP_ON_FAILURE_DUE_TO_WIFICOND; i++) {
+            mWifiMetrics.incrementNumSetupSoftApInterfaceFailureDueToWificond();
+        }
+        for (int i = 0; i < NUM_SOFTAP_ON_FAILURE_DUE_TO_HOSTAPD; i++) {
+            mWifiMetrics.incrementNumSetupSoftApInterfaceFailureDueToHostapd();
+        }
+        for (int i = 0; i < NUM_SOFTAP_INTERFACE_DOWN; i++) {
+            mWifiMetrics.incrementNumSoftApInterfaceDown();
+        }
+        for (int i = 0; i < NUM_CLIENT_INTERFACE_DOWN; i++) {
+            mWifiMetrics.incrementNumClientInterfaceDown();
         }
         for (int i = 0; i < NUM_PASSPOINT_PROVIDER_INSTALLATION; i++) {
             mWifiMetrics.incrementNumPasspointProviderInstallation();
@@ -610,6 +660,8 @@ public class WifiMetricsTest {
         for (int i = 0; i < NUM_WPS_CANCELLATION; i++) {
             mWifiMetrics.incrementWpsCancellationCount();
         }
+
+        mWifiMetrics.setWatchdogSuccessTimeDurationMs(NUM_WATCHDOG_SUCCESS_DURATION_MS);
     }
 
     private void addSoftApEventsToMetrics() {
@@ -732,6 +784,8 @@ public class WifiMetricsTest {
                 mDecodedProto.numLastResortWatchdogTriggersWithBadOther);
         assertEquals(NUM_LAST_RESORT_WATCHDOG_SUCCESSES,
                 mDecodedProto.numLastResortWatchdogSuccesses);
+        assertEquals(WATCHDOG_TOTAL_CONNECTION_FAILURE_COUNT_AFTER_TRIGGER,
+                mDecodedProto.watchdogTotalConnectionFailureCountAfterTrigger);
         assertEquals(TEST_RECORD_DURATION_SEC,
                 mDecodedProto.recordDurationSec);
         for (int i = 0; i < NUM_RSSI_LEVELS_TO_INCREMENT; i++) {
@@ -764,6 +818,12 @@ public class WifiMetricsTest {
                 mDecodedProto.numScans);
         assertEquals(NUM_CONNECTIVITY_ONESHOT_SCAN_EVENT,
                 mDecodedProto.numConnectivityOneshotScans);
+        assertEquals(NUM_EXTERNAL_APP_ONESHOT_SCAN_REQUESTS,
+                mDecodedProto.numExternalAppOneshotScanRequests);
+        assertEquals(NUM_EXTERNAL_FOREGROUND_APP_ONESHOT_SCAN_REQUESTS_THROTTLED,
+                mDecodedProto.numExternalForegroundAppOneshotScanRequestsThrottled);
+        assertEquals(NUM_EXTERNAL_BACKGROUND_APP_ONESHOT_SCAN_REQUESTS_THROTTLED,
+                mDecodedProto.numExternalBackgroundAppOneshotScanRequestsThrottled);
 
         for (int score_index = 0; score_index < NUM_WIFI_SCORES_TO_INCREMENT; score_index++) {
             assertEquals(WIFI_SCORE_RANGE_MIN + score_index,
@@ -793,9 +853,22 @@ public class WifiMetricsTest {
                      mDecodedProto.softApReturnCode[2].count);
         assertEquals(NUM_HAL_CRASHES, mDecodedProto.numHalCrashes);
         assertEquals(NUM_WIFICOND_CRASHES, mDecodedProto.numWificondCrashes);
-        assertEquals(NUM_WIFI_ON_FAILURE_DUE_TO_HAL, mDecodedProto.numWifiOnFailureDueToHal);
+        assertEquals(NUM_SUPPLICANT_CRASHES, mDecodedProto.numSupplicantCrashes);
+        assertEquals(NUM_HOSTAPD_CRASHES, mDecodedProto.numHostapdCrashes);
+        assertEquals(NUM_WIFI_ON_FAILURE_DUE_TO_HAL,
+                mDecodedProto.numSetupClientInterfaceFailureDueToHal);
         assertEquals(NUM_WIFI_ON_FAILURE_DUE_TO_WIFICOND,
-                mDecodedProto.numWifiOnFailureDueToWificond);
+                mDecodedProto.numSetupClientInterfaceFailureDueToWificond);
+        assertEquals(NUM_WIFI_ON_FAILURE_DUE_TO_SUPPLICANT,
+                mDecodedProto.numSetupClientInterfaceFailureDueToSupplicant);
+        assertEquals(NUM_SOFTAP_ON_FAILURE_DUE_TO_HAL,
+                mDecodedProto.numSetupSoftApInterfaceFailureDueToHal);
+        assertEquals(NUM_SOFTAP_ON_FAILURE_DUE_TO_WIFICOND,
+                mDecodedProto.numSetupSoftApInterfaceFailureDueToWificond);
+        assertEquals(NUM_SOFTAP_ON_FAILURE_DUE_TO_HOSTAPD,
+                mDecodedProto.numSetupSoftApInterfaceFailureDueToHostapd);
+        assertEquals(NUM_CLIENT_INTERFACE_DOWN, mDecodedProto.numClientInterfaceDown);
+        assertEquals(NUM_SOFTAP_INTERFACE_DOWN, mDecodedProto.numSoftApInterfaceDown);
         assertEquals(NUM_PASSPOINT_PROVIDERS, mDecodedProto.numPasspointProviders);
         assertEquals(NUM_PASSPOINT_PROVIDER_INSTALLATION,
                 mDecodedProto.numPasspointProviderInstallation);
@@ -854,6 +927,9 @@ public class WifiMetricsTest {
         assertEquals(NUM_WPS_OTHER_CONNECTION_FAILURE, wps_metrics.numWpsOtherConnectionFailure);
         assertEquals(NUM_WPS_SUPPLICANT_FAILURE, wps_metrics.numWpsSupplicantFailure);
         assertEquals(NUM_WPS_CANCELLATION, wps_metrics.numWpsCancellation);
+
+        assertEquals(NUM_WATCHDOG_SUCCESS_DURATION_MS,
+                mDecodedProto.watchdogTriggerToConnectionSuccessDurationMs);
     }
 
     /**
@@ -982,6 +1058,26 @@ public class WifiMetricsTest {
                 SCAN_RESULT_LEVEL);
         assertEquals(mDecodedProto.connectionEvent[1].routerFingerprint.routerTechnology,
                 NETWORK_DETAIL_WIFIMODE);
+    }
+
+    /**
+     * Test that WifiMetrics is serializing/deserializing association time out events.
+     */
+    @Test
+    public void testMetricsAssociationTimedOut() throws Exception {
+        mWifiMetrics.startConnectionEvent(null, "RED",
+                WifiMetricsProto.ConnectionEvent.ROAM_NONE);
+        mWifiMetrics.endConnectionEvent(
+                WifiMetrics.ConnectionEvent.FAILURE_ASSOCIATION_TIMED_OUT,
+                WifiMetricsProto.ConnectionEvent.HLF_NONE);
+
+        //Dump proto and deserialize
+        //This should clear all the metrics in mWifiMetrics,
+        dumpProtoAndDeserialize();
+        //Check there is only 1 connection events
+        assertEquals(mDecodedProto.connectionEvent.length, 1);
+        assertEquals(mDecodedProto.connectionEvent[0].level2FailureCode,
+                WifiMetrics.ConnectionEvent.FAILURE_ASSOCIATION_TIMED_OUT);
     }
 
     /**
@@ -1462,29 +1558,29 @@ public class WifiMetricsTest {
         long hessid1 = 10;
         int anqpDomainId1 = 5;
         scan.add(buildMockScanDetailPasspoint("PASSPOINT_XX", "00:02:03:04:05:06", hessid1,
-                anqpDomainId1, NetworkDetail.HSRelease.R1));
+                anqpDomainId1, NetworkDetail.HSRelease.R1, true));
         scan.add(buildMockScanDetailPasspoint("PASSPOINT_XY", "01:02:03:04:05:06", hessid1,
-                anqpDomainId1, NetworkDetail.HSRelease.R1));
+                anqpDomainId1, NetworkDetail.HSRelease.R1, true));
         scan.add(buildMockScanDetailPasspoint("PASSPOINT_XYZ", "02:02:03:04:05:06", hessid1,
-                anqpDomainId1, NetworkDetail.HSRelease.Unknown));
+                anqpDomainId1, NetworkDetail.HSRelease.Unknown, true));
         // 2 R2 passpoint APs belonging to a single provider: hessid2
         long hessid2 = 12;
         int anqpDomainId2 = 6;
         scan.add(buildMockScanDetailPasspoint("PASSPOINT_Y", "AA:02:03:04:05:06", hessid2,
-                anqpDomainId2, NetworkDetail.HSRelease.R2));
+                anqpDomainId2, NetworkDetail.HSRelease.R2, true));
         scan.add(buildMockScanDetailPasspoint("PASSPOINT_Z", "AB:02:03:04:05:06", hessid2,
-                anqpDomainId2, NetworkDetail.HSRelease.R2));
+                anqpDomainId2, NetworkDetail.HSRelease.R2, true));
         mWifiMetrics.incrementAvailableNetworksHistograms(scan, true);
         scan = new ArrayList<ScanDetail>();
         // 3 R2 passpoint APs belonging to a single provider: hessid3 (in next scan)
         long hessid3 = 15;
         int anqpDomainId3 = 8;
         scan.add(buildMockScanDetailPasspoint("PASSPOINT_Y", "AA:02:03:04:05:06", hessid3,
-                anqpDomainId3, NetworkDetail.HSRelease.R2));
+                anqpDomainId3, NetworkDetail.HSRelease.R2, true));
         scan.add(buildMockScanDetailPasspoint("PASSPOINT_Y", "AA:02:03:04:05:06", hessid3,
-                anqpDomainId3, NetworkDetail.HSRelease.R2));
+                anqpDomainId3, NetworkDetail.HSRelease.R2, false));
         scan.add(buildMockScanDetailPasspoint("PASSPOINT_Z", "AB:02:03:04:05:06", hessid3,
-                anqpDomainId3, NetworkDetail.HSRelease.R2));
+                anqpDomainId3, NetworkDetail.HSRelease.R2, true));
         mWifiMetrics.incrementAvailableNetworksHistograms(scan, true);
         dumpProtoAndDeserialize();
 
@@ -1501,9 +1597,9 @@ public class WifiMetricsTest {
                 WifiMetrics.MAX_TOTAL_PASSPOINT_UNIQUE_ESS_BUCKET) + 5;
         for (int i = 0; i < lotsOfSSids; i++) {
             scan.add(buildMockScanDetailPasspoint("PASSPOINT_XX" + i, "00:02:03:04:05:06", i,
-                    i + 10, NetworkDetail.HSRelease.R1));
+                    i + 10, NetworkDetail.HSRelease.R1, true));
             scan.add(buildMockScanDetailPasspoint("PASSPOINT_XY" + i, "AA:02:03:04:05:06", 1000 * i,
-                    i + 10, NetworkDetail.HSRelease.R2));
+                    i + 10, NetworkDetail.HSRelease.R2, false));
         }
         mWifiMetrics.incrementAvailableNetworksHistograms(scan, true);
         dumpProtoAndDeserialize();
@@ -1534,6 +1630,7 @@ public class WifiMetricsTest {
         when(mockScanDetail80211mc.getNetworkDetail()).thenReturn(mockNetworkDetail80211mc);
         when(mockScanDetailNon80211mc.getScanResult()).thenReturn(mockScanResult);
         when(mockScanDetail80211mc.getScanResult()).thenReturn(mockScanResult);
+        when(mWns.isSignalTooWeak(eq(mockScanDetail80211mc.getScanResult()))).thenReturn(true);
         List<ScanDetail> scan = new ArrayList<ScanDetail>();
 
         // 4 scans (a few non-802.11mc supporting APs on each)
