@@ -21,8 +21,6 @@ import static android.net.wifi.WifiManager.WIFI_STATE_DISABLING;
 import static android.net.wifi.WifiManager.WIFI_STATE_ENABLED;
 import static android.net.wifi.WifiManager.WIFI_STATE_ENABLING;
 import static android.net.wifi.WifiManager.WIFI_STATE_UNKNOWN;
-import static android.telephony.TelephonyManager.CALL_STATE_IDLE;
-import static android.telephony.TelephonyManager.CALL_STATE_OFFHOOK;
 
 import android.app.ActivityManager;
 import android.app.PendingIntent;
@@ -52,6 +50,7 @@ import android.net.NetworkUtils;
 import android.net.RouteInfo;
 import android.net.StaticIpConfiguration;
 import android.net.TrafficStats;
+import android.net.apf.ApfCapabilities;
 import android.net.dhcp.DhcpClient;
 import android.net.ip.IpClient;
 import android.net.wifi.RssiPacketCountInfo;
@@ -61,6 +60,7 @@ import android.net.wifi.WifiConfiguration;
 import android.net.wifi.WifiEnterpriseConfig;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
+import android.net.wifi.WifiSsid;
 import android.net.wifi.hotspot2.IProvisioningCallback;
 import android.net.wifi.hotspot2.OsuProvider;
 import android.net.wifi.hotspot2.PasspointConfiguration;
@@ -79,7 +79,6 @@ import android.os.UserManager;
 import android.os.WorkSource;
 import android.provider.Settings;
 import android.system.OsConstants;
-import android.telephony.PhoneStateListener;
 import android.telephony.TelephonyManager;
 import android.text.TextUtils;
 import android.util.Log;
@@ -95,8 +94,6 @@ import com.android.internal.util.MessageUtils;
 import com.android.internal.util.Protocol;
 import com.android.internal.util.State;
 import com.android.internal.util.StateMachine;
-import com.android.server.wifi.WifiNative.InterfaceCallback;
-import com.android.server.wifi.WifiNative.StatusListener;
 import com.android.server.wifi.hotspot2.AnqpEvent;
 import com.android.server.wifi.hotspot2.IconEvent;
 import com.android.server.wifi.hotspot2.NetworkDetail;
@@ -129,17 +126,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * TODO:
- * Deprecate WIFI_STATE_UNKNOWN
- */
-
-/**
  * Track the state of Wifi connectivity. All event handling is done here,
  * and all changes in connectivity state are initiated here.
  *
  * Wi-Fi now supports three modes of operation: Client, SoftAp and p2p
  * In the current implementation, we support concurrent wifi p2p and wifi operation.
- * The WifiStateMachine handles SoftAp and Client operations while WifiP2pService
+ * The WifiStateMachine handles Client operations while WifiP2pService
  * handles p2p operation.
  *
  * @hide
@@ -195,7 +187,7 @@ public class WifiStateMachine extends StateMachine {
     private ConnectivityManager mCm;
     private BaseWifiDiagnostics mWifiDiagnostics;
     private ScanRequestProxy mScanRequestProxy;
-    private WifiApConfigStore mWifiApConfigStore;
+    private WifiP2pServiceImpl wifiP2pServiceImpl;
     private final boolean mP2pSupported;
     private final AtomicBoolean mP2pConnected = new AtomicBoolean(false);
     private boolean mTemporarilyDisconnectWifi = false;
@@ -205,6 +197,7 @@ public class WifiStateMachine extends StateMachine {
     private final WifiCountryCode mCountryCode;
     // Object holding most recent wifi score report and bad Linkspeed count
     private final WifiScoreReport mWifiScoreReport;
+    private final SarManager mSarManager;
     public WifiScoreReport getWifiScoreReport() {
         return mWifiScoreReport;
     }
@@ -220,44 +213,7 @@ public class WifiStateMachine extends StateMachine {
     private String mLastBssid;
     private int mLastNetworkId; // The network Id we successfully joined
 
-    private final StatusListener mWifiNativeStatusListener = (boolean isReady) -> {
-        if (!isReady) {
-            sendMessage(CMD_WIFINATIVE_FAILURE);
-        }
-    };
-
-    private final InterfaceCallback mWifiNativeInterfaceCallback = new InterfaceCallback() {
-        @Override
-        public void onDestroyed(String ifaceName) {
-            if (mInterfaceName != null && mInterfaceName.equals(ifaceName)) {
-                sendMessage(CMD_INTERFACE_DESTROYED);
-            }
-        }
-
-        @Override
-        public void onUp(String ifaceName) {
-            if (mInterfaceName != null && mInterfaceName.equals(ifaceName)) {
-                sendMessage(CMD_INTERFACE_STATUS_CHANGED, 1);
-            }
-        }
-
-        @Override
-        public void onDown(String ifaceName) {
-            if (mInterfaceName != null && mInterfaceName.equals(ifaceName)) {
-                sendMessage(CMD_INTERFACE_STATUS_CHANGED, 0);
-            }
-        }
-    };
     private boolean mIpReachabilityDisconnectEnabled = true;
-
-    private WifiManager.SoftApCallback mSoftApCallback;
-
-    /**
-     * Called from WifiServiceImpl to register a callback for notifications from SoftApManager
-     */
-    public void registerSoftApCallback(WifiManager.SoftApCallback callback) {
-        mSoftApCallback = callback;
-    }
 
     private void processRssiThreshold(byte curRssi, int reason,
             WifiNative.WifiRssiEventHandler rssiHandler) {
@@ -301,6 +257,8 @@ public class WifiStateMachine extends StateMachine {
 
     // variable indicating we are expecting a mode switch - do not attempt recovery for failures
     private boolean mModeChange = false;
+
+    private ClientModeManager.Listener mClientModeCallback = null;
 
     private boolean mBluetoothConnectionActive = false;
 
@@ -459,29 +417,10 @@ public class WifiStateMachine extends StateMachine {
 
     /* The base for wifi message types */
     static final int BASE = Protocol.BASE_WIFI;
-    /* Start the STA interface */
-    static final int CMD_START_SUPPLICANT                               = BASE + 11;
-    /* Stop the STA interface */
-    static final int CMD_STOP_SUPPLICANT                                = BASE + 12;
-    /* STA interface destroyed */
-    static final int CMD_INTERFACE_DESTROYED                            = BASE + 13;
-    /* STA interface down */
-    static final int CMD_INTERFACE_DOWN                                 = BASE + 14;
     /* Indicates Static IP succeeded */
     static final int CMD_STATIC_IP_SUCCESS                              = BASE + 15;
     /* Indicates Static IP failed */
     static final int CMD_STATIC_IP_FAILURE                              = BASE + 16;
-    /* Interface status change */
-    static final int CMD_INTERFACE_STATUS_CHANGED                       = BASE + 20;
-
-    /* Start the soft access point */
-    static final int CMD_START_AP                                       = BASE + 21;
-    /* Indicates soft ap start failed */
-    static final int CMD_START_AP_FAILURE                               = BASE + 22;
-    /* Stop the soft access point */
-    static final int CMD_STOP_AP                                        = BASE + 23;
-    /* Soft access point teardown is completed. */
-    static final int CMD_AP_STOPPED                                     = BASE + 24;
 
     static final int CMD_BLUETOOTH_ADAPTER_STATE_CHANGE                 = BASE + 31;
 
@@ -697,14 +636,11 @@ public class WifiStateMachine extends StateMachine {
     /* used to indicate that the foreground user was switched */
     static final int CMD_USER_STOP                                      = BASE + 207;
 
-    /* Signals that one of the native daemons is dead. */
-    private static final int CMD_WIFINATIVE_FAILURE                     = BASE + 250;
+    /* Read the APF program & data buffer */
+    static final int CMD_READ_PACKET_FILTER                             = BASE + 208;
 
     /* Indicates that diagnostics should time out a connection start event. */
     private static final int CMD_DIAGS_CONNECT_TIMEOUT                  = BASE + 252;
-
-    /* Used to set the tx power limit for SAR during the start of a phone call. */
-    private static final int CMD_SELECT_TX_POWER_SCENARIO               = BASE + 253;
 
     // Start subscription provisioning with a given provider
     private static final int CMD_START_SUBSCRIPTION_PROVISIONING        = BASE + 254;
@@ -769,18 +705,11 @@ public class WifiStateMachine extends StateMachine {
     private final int mThresholdMinimumRssi24;
     private final boolean mEnableChipWakeUpWhenAssociated;
     private final boolean mEnableRssiPollWhenAssociated;
-    private final boolean mEnableVoiceCallSarTxPowerLimit;
 
     int mRunningBeaconCount = 0;
 
     /* Default parent state */
     private State mDefaultState = new DefaultState();
-    /* Temporary initial state */
-    private State mInitialState = new InitialState();
-    /* Driver loaded and supplicant ready */
-    private State mSupplicantStartedState = new SupplicantStartedState();
-    /* Scan for networks, no connection will be established */
-    private State mScanModeState = new ScanModeState();
     /* Connecting to an access point */
     private State mConnectModeState = new ConnectModeState();
     /* Connected at 802.11 (L2) level */
@@ -795,8 +724,6 @@ public class WifiStateMachine extends StateMachine {
     private State mDisconnectingState = new DisconnectingState();
     /* Network is not connected, supplicant assoc+auth is not complete */
     private State mDisconnectedState = new DisconnectedState();
-    /* Soft ap state */
-    private State mSoftApState = new SoftApState();
 
     /**
      * One of  {@link WifiManager#WIFI_STATE_DISABLED},
@@ -839,7 +766,6 @@ public class WifiStateMachine extends StateMachine {
         }
         return mTelephonyManager;
     }
-    private final WifiPhoneStateListener mPhoneStateListener;
 
     private final IBatteryStats mBatteryStats;
 
@@ -857,7 +783,8 @@ public class WifiStateMachine extends StateMachine {
                             UserManager userManager, WifiInjector wifiInjector,
                             BackupManagerProxy backupManagerProxy, WifiCountryCode countryCode,
                             WifiNative wifiNative,
-                            WrongPasswordNotifier wrongPasswordNotifier) {
+                            WrongPasswordNotifier wrongPasswordNotifier,
+                            SarManager sarManager) {
         super("WifiStateMachine", looper);
         mWifiInjector = wifiInjector;
         mWifiMetrics = mWifiInjector.getWifiMetrics();
@@ -869,6 +796,7 @@ public class WifiStateMachine extends StateMachine {
         mWifiNative = wifiNative;
         mBackupManagerProxy = backupManagerProxy;
         mWrongPasswordNotifier = wrongPasswordNotifier;
+        mSarManager = sarManager;
 
         // TODO refactor WifiNative use of context out into it's own class
         mNetworkInfo = new NetworkInfo(ConnectivityManager.TYPE_WIFI, 0, NETWORKTYPE, "");
@@ -895,7 +823,6 @@ public class WifiStateMachine extends StateMachine {
                 mFacade.makeSupplicantStateTracker(context, mWifiConfigManager, getHandler());
 
         mLinkProperties = new LinkProperties();
-        mPhoneStateListener = new WifiPhoneStateListener(looper);
         mMcastLockManagerFilterController = new McastLockManagerFilterController();
 
         mNetworkInfo.setIsAvailable(false);
@@ -990,24 +917,18 @@ public class WifiStateMachine extends StateMachine {
                 R.integer.config_wifi_framework_wifi_score_bad_rssi_threshold_5GHz);
         mThresholdMinimumRssi24 = context.getResources().getInteger(
                 R.integer.config_wifi_framework_wifi_score_bad_rssi_threshold_24GHz);
-        mEnableVoiceCallSarTxPowerLimit = mContext.getResources().getBoolean(
-                R.bool.config_wifi_framework_enable_voice_call_sar_tx_power_limit);
         mEnableChipWakeUpWhenAssociated = true;
         mEnableRssiPollWhenAssociated = true;
 
         // CHECKSTYLE:OFF IndentationCheck
         addState(mDefaultState);
-            addState(mInitialState, mDefaultState);
-                addState(mSupplicantStartedState, mInitialState);
-                    addState(mConnectModeState, mSupplicantStartedState);
-                        addState(mL2ConnectedState, mConnectModeState);
-                            addState(mObtainingIpState, mL2ConnectedState);
-                            addState(mConnectedState, mL2ConnectedState);
-                            addState(mRoamingState, mL2ConnectedState);
-                        addState(mDisconnectingState, mConnectModeState);
-                        addState(mDisconnectedState, mConnectModeState);
-            addState(mScanModeState, mDefaultState);
-            addState(mSoftApState, mDefaultState);
+            addState(mConnectModeState, mDefaultState);
+                addState(mL2ConnectedState, mConnectModeState);
+                    addState(mObtainingIpState, mL2ConnectedState);
+                    addState(mConnectedState, mL2ConnectedState);
+                    addState(mRoamingState, mL2ConnectedState);
+                addState(mDisconnectingState, mConnectModeState);
+                addState(mDisconnectedState, mConnectModeState);
         // CHECKSTYLE:ON IndentationCheck
 
         setInitialState(mDefaultState);
@@ -1021,13 +942,6 @@ public class WifiStateMachine extends StateMachine {
         // Learn the initial state of whether the screen is on.
         // We update this field when we receive broadcasts from the system.
         handleScreenStateChanged(powerManager.isInteractive());
-
-        final Intent intent = new Intent(WifiManager.WIFI_SCAN_AVAILABLE);
-        intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
-        intent.putExtra(WifiManager.EXTRA_SCAN_AVAILABLE, WIFI_STATE_DISABLED);
-        mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
-
-        sendWifiScanAvailable(false);
     }
 
     private void registerForWifiMonitorEvents()  {
@@ -1148,6 +1062,11 @@ public class WifiStateMachine extends StateMachine {
         }
 
         @Override
+        public void startReadPacketFilter() {
+            sendMessage(CMD_READ_PACKET_FILTER);
+        }
+
+        @Override
         public void setFallbackMulticastFilter(boolean enabled) {
             sendMessage(CMD_SET_FALLBACK_PACKET_FILTERING, enabled);
         }
@@ -1163,6 +1082,11 @@ public class WifiStateMachine extends StateMachine {
         handlePostDhcpSetup();
         mIpClient.stop();
     }
+
+    public void setWifiDiagnostics(BaseWifiDiagnostics WifiDiagnostics) {
+        mWifiDiagnostics = WifiDiagnostics;
+    }
+
 
     PendingIntent getPrivateBroadcast(String action, int requestCode) {
         Intent intent = new Intent(action, null);
@@ -1197,6 +1121,8 @@ public class WifiStateMachine extends StateMachine {
         mCountryCode.enableVerboseLogging(verbose);
         mWifiScoreReport.enableVerboseLogging(mVerboseLoggingEnabled);
         mWifiDiagnostics.startLogging(mVerboseLoggingEnabled);
+        if (wifiP2pServiceImpl != null)
+            wifiP2pServiceImpl.enableVerboseLogging(verbose);
         mWifiMonitor.enableVerboseLogging(verbose);
         mWifiNative.enableVerboseLogging(verbose);
         mWifiConfigManager.enableVerboseLogging(verbose);
@@ -1454,29 +1380,34 @@ public class WifiStateMachine extends StateMachine {
     }
 
     /**
-     * TODO: doc
+     * Temporary method that allows the active ClientModeManager to set the wifi state that is
+     * retrieved by API calls. This will be removed when WifiServiceImpl no longer directly calls
+     * this class (b/31479117).
+     *
+     * @param newState new state to set, invalid states are ignored.
      */
-    public void setSupplicantRunning(boolean enable) {
-        if (enable) {
-            sendMessage(CMD_START_SUPPLICANT);
-        } else {
-            sendMessage(CMD_STOP_SUPPLICANT);
+    public void setWifiStateForApiCalls(int newState) {
+        switch (newState) {
+            case WIFI_STATE_DISABLING:
+            case WIFI_STATE_DISABLED:
+            case WIFI_STATE_ENABLING:
+            case WIFI_STATE_ENABLED:
+            case WIFI_STATE_UNKNOWN:
+                if (mVerboseLoggingEnabled) {
+                    Log.d(TAG, "setting wifi state to: " + newState);
+                }
+                mWifiState.set(newState);
+                return;
+            default:
+                Log.d(TAG, "attempted to set an invalid state: " + newState);
+                return;
         }
     }
 
     /**
-     * TODO: doc
-     */
-    public void setHostApRunning(SoftApModeConfiguration wifiConfig, boolean enable) {
-        if (enable) {
-            sendMessage(CMD_START_AP, wifiConfig);
-        } else {
-            sendMessage(CMD_STOP_AP);
-        }
-    }
-
-    /**
-     * TODO: doc
+     * Method used by WifiServiceImpl to get the current state of Wifi (in client mode) for API
+     * calls.  This will be removed when WifiService no longer directly calls this class
+     * (b/31479117).
      */
     public int syncGetWifiState() {
         return mWifiState.get();
@@ -1553,10 +1484,27 @@ public class WifiStateMachine extends StateMachine {
     /**
      * TODO: doc
      */
-    public void setOperationalMode(int mode) {
-        if (mVerboseLoggingEnabled) log("setting operational mode to " + String.valueOf(mode));
+    public void setOperationalMode(int mode, String ifaceName) {
+        if (mVerboseLoggingEnabled) {
+            log("setting operational mode to " + String.valueOf(mode) + " for iface: " + ifaceName);
+        }
         mModeChange = true;
-        sendMessage(CMD_SET_OPERATIONAL_MODE, mode, 0);
+        if (mode != CONNECT_MODE) {
+            // we are disabling client mode...   need to exit connect mode now
+            transitionTo(mDefaultState);
+        } else {
+            // do a quick sanity check on the iface name, make sure it isn't null
+            if (ifaceName != null) {
+                mInterfaceName = ifaceName;
+                transitionTo(mDisconnectedState);
+            } else {
+                Log.e(TAG, "supposed to enter connect mode, but iface is null -> DefaultState");
+                transitionTo(mDefaultState);
+            }
+        }
+        // use the CMD_SET_OPERATIONAL_MODE to force the transitions before other messages are
+        // handled.
+        sendMessageAtFrontOfQueue(CMD_SET_OPERATIONAL_MODE);
     }
 
     /**
@@ -2531,31 +2479,6 @@ public class WifiStateMachine extends StateMachine {
         if (mVerboseLoggingEnabled) log("mSuspendOptNeedsDisabled " + mSuspendOptNeedsDisabled);
     }
 
-    private void sendWifiScanAvailable(boolean available) {
-        int state = WIFI_STATE_DISABLED;
-        if (available) {
-            state = WIFI_STATE_ENABLED;
-        }
-        final Intent intent = new Intent(WifiManager.WIFI_SCAN_AVAILABLE);
-        intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
-        intent.putExtra(WifiManager.EXTRA_SCAN_AVAILABLE, state);
-        mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
-    }
-
-    private void setWifiState(int wifiState) {
-        final int previousWifiState = mWifiState.get();
-
-        mWifiState.set(wifiState);
-
-        if (mVerboseLoggingEnabled) log("setWifiState: " + syncGetWifiStateByName());
-
-        final Intent intent = new Intent(WifiManager.WIFI_STATE_CHANGED_ACTION);
-        intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
-        intent.putExtra(WifiManager.EXTRA_WIFI_STATE, wifiState);
-        intent.putExtra(WifiManager.EXTRA_PREVIOUS_WIFI_STATE, previousWifiState);
-        mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
-    }
-
     /*
      * Fetch RSSI, linkspeed, and frequency on current connection
      */
@@ -2823,6 +2746,8 @@ public class WifiStateMachine extends StateMachine {
             mWifiInfo.setBSSID(null);
             mWifiInfo.setSSID(null);
         }
+        // SSID might have been updated, so call updateCapabilities
+        updateCapabilities();
 
         final WifiConfiguration config = getCurrentWifiConfiguration();
         if (config != null) {
@@ -3280,47 +3205,13 @@ public class WifiStateMachine extends StateMachine {
         // First set up Wifi Direct
         if (mP2pSupported) {
             IBinder s1 = mFacade.getService(Context.WIFI_P2P_SERVICE);
-            WifiP2pServiceImpl wifiP2pServiceImpl =
+            wifiP2pServiceImpl =
                     (WifiP2pServiceImpl) IWifiP2pManager.Stub.asInterface(s1);
 
             if (wifiP2pServiceImpl != null) {
                 mWifiP2pChannel = new AsyncChannel();
                 mWifiP2pChannel.connect(mContext, getHandler(),
                         wifiP2pServiceImpl.getP2pStateMachineMessenger());
-            }
-        }
-    }
-
-    /**
-     * Register the phone listener if we need to set/reset the power limits during voice call for
-     * this device.
-     */
-    private void maybeRegisterPhoneListener() {
-        if (mEnableVoiceCallSarTxPowerLimit) {
-            logd("Registering for telephony call state changes");
-            getTelephonyManager().listen(
-                    mPhoneStateListener, PhoneStateListener.LISTEN_CALL_STATE);
-        }
-    }
-
-    /**
-     * Listen for phone call state events to set/reset TX power limits for SAR requirements.
-     */
-    private class WifiPhoneStateListener extends PhoneStateListener {
-        WifiPhoneStateListener(Looper looper) {
-            super(looper);
-        }
-
-        @Override
-        public void onCallStateChanged(int state, String incomingNumber) {
-            if (mEnableVoiceCallSarTxPowerLimit) {
-                if (state == CALL_STATE_OFFHOOK) {
-                    sendMessage(CMD_SELECT_TX_POWER_SCENARIO,
-                            WifiNative.TX_POWER_SCENARIO_VOICE_CALL);
-                } else if (state == CALL_STATE_IDLE) {
-                    sendMessage(CMD_SELECT_TX_POWER_SCENARIO,
-                            WifiNative.TX_POWER_SCENARIO_NORMAL);
-                }
             }
         }
     }
@@ -3343,15 +3234,14 @@ public class WifiStateMachine extends StateMachine {
         if (!WifiConfiguration.isValidMacAddressForRandomization(newMac)) {
             Log.wtf(TAG, "Config generated an invalid MAC address");
         } else if (currentMac.equals(newMac)) {
-            Log.i(TAG, "No changes in MAC address");
+            Log.d(TAG, "No changes in MAC address");
         } else {
-            Log.i(TAG, "ConnectedMacRandomization SSID(" + config.getPrintableSsid()
-                    + "). setMacAddress(" + newMac.toString() + ") from "
-                    + currentMac.toString());
+            mWifiMetrics.logStaEvent(StaEvent.TYPE_MAC_CHANGE, config);
             boolean setMacSuccess =
                     mWifiNative.setMacAddress(mInterfaceName, newMac);
-            Log.i(TAG, "ConnectedMacRandomization  ...setMacAddress("
-                    + newMac.toString() + ") = " + setMacSuccess);
+            Log.d(TAG, "ConnectedMacRandomization SSID(" + config.getPrintableSsid()
+                    + "). setMacAddress(" + newMac.toString() + ") from "
+                    + currentMac.toString() + " = " + setMacSuccess);
         }
     }
 
@@ -3365,25 +3255,28 @@ public class WifiStateMachine extends StateMachine {
         boolean macRandomizationEnabled = (macRandomizationFlag == 1);
         mEnableConnectedMacRandomization.set(macRandomizationEnabled);
         mWifiInfo.setEnableConnectedMacRandomization(macRandomizationEnabled);
+        mWifiMetrics.setIsMacRandomizationOn(macRandomizationEnabled);
         Log.d(TAG, "EnableConnectedMacRandomization Setting changed to "
                 + macRandomizationEnabled);
     }
 
     /**
-     * Handle the error case where our underlying interface went down (if we do not have mac
-     * randomization enabled (b/72459123).
+     * Helper method to check if Connected MAC Randomization is enabled - onDown events are skipped
+     * if this feature is enabled (b/72459123).
      *
-     * This method triggers SelfRecovery with the error of REASON_STA_IFACE_DOWN.  SelfRecovery then
-     * decides if wifi should be restarted or disabled.
+     * @return boolean true if Connected MAC randomization is enabled, false otherwise
      */
-    private void handleInterfaceDown() {
-        if (mEnableConnectedMacRandomization.get()) {
-            // interface will go down when mac randomization is active, skip
-            Log.d(TAG, "MacRandomization enabled, ignoring iface down");
-            return;
-        }
+    public boolean isConnectedMacRandomizationEnabled() {
+        return mEnableConnectedMacRandomization.get();
+    }
 
-        Log.e(TAG, "Detected an interface down, report failure to SelfRecovery");
+    /**
+     * Helper method allowing ClientModeManager to report an error (interface went down) and trigger
+     * recovery.
+     *
+     * @param reason int indicating the SelfRecovery failure type.
+     */
+    public void failureDetected(int reason) {
         // report a failure
         mWifiInjector.getSelfRecovery().trigger(SelfRecovery.REASON_STA_IFACE_DOWN);
     }
@@ -3489,16 +3382,10 @@ public class WifiStateMachine extends StateMachine {
                         Log.e(TAG, "Failed to load from config store");
                     }
                     maybeRegisterNetworkFactory();
-                    maybeRegisterPhoneListener();
                     break;
                 case CMD_SCREEN_STATE_CHANGED:
                     handleScreenStateChanged(message.arg1 != 0);
                     break;
-                case CMD_START_SUPPLICANT:
-                case CMD_STOP_SUPPLICANT:
-                case CMD_START_AP_FAILURE:
-                case CMD_STOP_AP:
-                case CMD_AP_STOPPED:
                 case CMD_DISCONNECT:
                 case CMD_RECONNECT:
                 case CMD_REASSOCIATE:
@@ -3526,34 +3413,11 @@ public class WifiStateMachine extends StateMachine {
                 case CMD_ROAM_WATCHDOG_TIMER:
                 case CMD_DISABLE_P2P_WATCHDOG_TIMER:
                 case CMD_DISABLE_EPHEMERAL_NETWORK:
-                case CMD_SELECT_TX_POWER_SCENARIO:
-                case CMD_WIFINATIVE_FAILURE:
-                case CMD_INTERFACE_DESTROYED:
-                case CMD_INTERFACE_DOWN:
-                case CMD_INTERFACE_STATUS_CHANGED:
                     messageHandlingStatus = MESSAGE_HANDLING_STATUS_DISCARD;
                     break;
-                case CMD_START_AP:
-                    transitionTo(mSoftApState);
-                    break;
                 case CMD_SET_OPERATIONAL_MODE:
-                    mOperationalMode = message.arg1;
-                    // now processing the mode change - we will start setting up new state and want
-                    // to know about failures
-                    mModeChange = false;
-                    if (mOperationalMode == DISABLED_MODE) {
-                        Log.d(TAG, "set operational mode - disabled.  stay in default");
-                        transitionTo(mDefaultState);
-                        break;
-                    } else if (mOperationalMode == CONNECT_MODE) {
-                        transitionTo(mInitialState);
-                    } else if (mOperationalMode == SCAN_ONLY_MODE
-                            || mOperationalMode == SCAN_ONLY_WITH_WIFI_OFF_MODE) {
-                        transitionTo(mScanModeState);
-                    } else {
-                        Log.e(TAG, "set operational mode with invalid mode: " + mOperationalMode);
-                        mOperationalMode = DISABLED_MODE;
-                    }
+                    // using the CMD_SET_OPERATIONAL_MODE (sent at front of queue) to trigger the
+                    // state transitions performed in setOperationalMode.
                     break;
                 case CMD_SET_SUSPEND_OPT_ENABLED:
                     if (message.arg1 == 1) {
@@ -3691,6 +3555,10 @@ public class WifiStateMachine extends StateMachine {
                 case CMD_INSTALL_PACKET_FILTER:
                     mWifiNative.installPacketFilter(mInterfaceName, (byte[]) message.obj);
                     break;
+                case CMD_READ_PACKET_FILTER:
+                    byte[] data = mWifiNative.readPacketFilter(mInterfaceName);
+                    mIpClient.readPacketFilterComplete(data);
+                    break;
                 case CMD_SET_FALLBACK_PACKET_FILTERING:
                     if ((boolean) message.obj) {
                         mWifiNative.startFilteringMulticastV4Packets(mInterfaceName);
@@ -3717,337 +3585,6 @@ public class WifiStateMachine extends StateMachine {
             return HANDLED;
         }
     }
-
-    class InitialState extends State {
-        private boolean mIfaceIsUp;
-
-        private void onUpChanged(boolean isUp) {
-            if (isUp == mIfaceIsUp) {
-                return;  // no change
-            }
-            mIfaceIsUp = isUp;
-            if (isUp) {
-                Log.d(TAG, "Client mode interface is up");
-                // for now, do nothing - client mode has never waited for iface up
-            } else {
-                // A driver/firmware hang can now put the interface in a down state.
-                // We detect the interface going down and recover from it
-                handleInterfaceDown();
-            }
-        }
-
-        private void cleanup() {
-            // tell scanning service that scans are not available - about to kill the interface and
-            // supplicant
-            sendWifiScanAvailable(false);
-
-            mWifiNative.registerStatusListener(mWifiNativeStatusListener);
-            // TODO: This teardown should ideally be handled in STOP_SUPPLICANT to be consistent
-            // with other mode managers. But, client mode is not yet controlled by
-            // WifiStateMachinePrime.
-            // TODO: Remove this big hammer. We cannot support concurrent interfaces with this!
-            mWifiNative.teardownAllInterfaces();
-            mInterfaceName = null;
-            mIfaceIsUp = false;
-        }
-
-        @Override
-        public void enter() {
-            mIfaceIsUp = false;
-            mWifiStateTracker.updateState(WifiStateTracker.INVALID);
-            cleanup();
-            sendMessage(CMD_START_SUPPLICANT);
-            setWifiState(WIFI_STATE_ENABLING);
-        }
-
-        @Override
-        public boolean processMessage(Message message) {
-            logStateAndMessage(message, this);
-            switch (message.what) {
-                case CMD_START_SUPPLICANT:
-                    mInterfaceName = mWifiNative.setupInterfaceForClientMode(false,
-                            mWifiNativeInterfaceCallback);
-                    if (TextUtils.isEmpty(mInterfaceName)) {
-                        Log.e(TAG, "setup failure when creating client interface.");
-                        setWifiState(WifiManager.WIFI_STATE_UNKNOWN);
-                        transitionTo(mDefaultState);
-                        break;
-                    }
-                    // now that we have the interface, initialize our up/down status
-                    onUpChanged(mWifiNative.isInterfaceUp(mInterfaceName));
-
-                    mIpClient = mFacade.makeIpClient(
-                            mContext, mInterfaceName, new IpClientCallback());
-                    mIpClient.setMulticastFilter(true);
-                    if (mVerboseLoggingEnabled) log("Supplicant start successful");
-                    registerForWifiMonitorEvents();
-                    mWifiInjector.getWifiLastResortWatchdog().clearAllFailureCounts();
-                    setSupplicantLogLevel();
-                    transitionTo(mSupplicantStartedState);
-                    break;
-                case CMD_SET_OPERATIONAL_MODE:
-                    if (message.arg1 == CONNECT_MODE) {
-                        break;
-                    } else {
-                        return NOT_HANDLED;
-                    }
-                case CMD_WIFINATIVE_FAILURE:
-                    Log.e(TAG, "One of the native daemons died unexpectedly. Triggering recovery");
-                    mWifiDiagnostics.captureBugReportData(
-                            WifiDiagnostics.REPORT_REASON_WIFINATIVE_FAILURE);
-                    mWifiInjector.getSelfRecovery().trigger(SelfRecovery.REASON_WIFINATIVE_FAILURE);
-                    break;
-                case CMD_INTERFACE_STATUS_CHANGED:
-                    boolean isUp = message.arg1 == 1;
-                    // For now, this message can be triggered due to link state and/or interface
-                    // status changes (b/77218676).  First check if we really see an iface down by
-                    // consulting our view of supplicant state.
-                    if (!isUp && SupplicantState.isDriverActive(mWifiInfo.getSupplicantState())) {
-                        // the driver is active, so this could just be part of normal operation, do
-                        // not disable wifi in these cases (ex, a network was removed) or worry
-                        // about the link status
-                        break;
-                    }
-
-                    onUpChanged(isUp);
-                    break;
-                default:
-                    return NOT_HANDLED;
-            }
-            return HANDLED;
-        }
-    }
-
-    class SupplicantStartedState extends State {
-        @Override
-        public void enter() {
-            if (mVerboseLoggingEnabled) {
-                logd("SupplicantStartedState enter");
-            }
-
-            // reset state related to supplicant starting
-            mSupplicantStateTracker.sendMessage(CMD_RESET_SUPPLICANT_STATE);
-            // Initialize data structures
-            mLastBssid = null;
-            mLastNetworkId = WifiConfiguration.INVALID_NETWORK_ID;
-            mLastSignalLevel = -1;
-            mWifiInfo.setMacAddress(mWifiNative.getMacAddress(mInterfaceName));
-            // Attempt to migrate data out of legacy store.
-            if (!mWifiConfigManager.migrateFromLegacyStore()) {
-                Log.e(TAG, "Failed to migrate from legacy config store");
-            }
-            sendSupplicantConnectionChangedBroadcast(true);
-
-            mWifiNative.setExternalSim(mInterfaceName, true);
-
-            setRandomMacOui();
-            mCountryCode.setReadyForChange(true);
-
-            if (mWifiConnectivityManager == null) {
-                synchronized (mWifiReqCountLock) {
-                    mWifiConnectivityManager =
-                            mWifiInjector.makeWifiConnectivityManager(mWifiInfo,
-                                                                      hasConnectionRequests());
-                    mWifiConnectivityManager.setUntrustedConnectionAllowed(mUntrustedReqCount > 0);
-                    mWifiConnectivityManager.handleScreenStateChanged(mScreenOn);
-                }
-            }
-
-            mWifiDiagnostics.startLogging(mVerboseLoggingEnabled);
-            mIsRunning = true;
-            updateBatteryWorkSource(null);
-            /**
-             * Enable bluetooth coexistence scan mode when bluetooth connection is active.
-             * When this mode is on, some of the low-level scan parameters used by the
-             * driver are changed to reduce interference with bluetooth
-             */
-            mWifiNative.setBluetoothCoexistenceScanMode(mInterfaceName, mBluetoothConnectionActive);
-            // Check if there is a voice call on-going and set/reset the tx power limit
-            // appropriately.
-            if (mEnableVoiceCallSarTxPowerLimit) {
-                if (getTelephonyManager().isOffhook()) {
-                    sendMessage(CMD_SELECT_TX_POWER_SCENARIO,
-                            WifiNative.TX_POWER_SCENARIO_VOICE_CALL);
-                } else {
-                    sendMessage(CMD_SELECT_TX_POWER_SCENARIO,
-                            WifiNative.TX_POWER_SCENARIO_NORMAL);
-                }
-            }
-
-            // initialize network state
-            setNetworkDetailedState(DetailedState.DISCONNECTED);
-
-            // Disable legacy multicast filtering, which on some chipsets defaults to enabled.
-            // Legacy IPv6 multicast filtering blocks ICMPv6 router advertisements which breaks IPv6
-            // provisioning. Legacy IPv4 multicast filtering may be re-enabled later via
-            // IpClient.Callback.setFallbackMulticastFilter()
-            mWifiNative.stopFilteringMulticastV4Packets(mInterfaceName);
-            mWifiNative.stopFilteringMulticastV6Packets(mInterfaceName);
-
-            // Transitioning to Disconnected state will trigger a scan and subsequently AutoJoin
-            transitionTo(mDisconnectedState);
-
-            // Set the right suspend mode settings
-            mWifiNative.setSuspendOptimizations(mInterfaceName, mSuspendOptNeedsDisabled == 0
-                    && mUserWantsSuspendOpt.get());
-
-            mWifiNative.setPowerSave(mInterfaceName, true);
-
-            if (mP2pSupported) {
-                p2pSendMessage(WifiStateMachine.CMD_ENABLE_P2P);
-            }
-
-            // Disable wpa_supplicant from auto reconnecting.
-            mWifiNative.enableStaAutoReconnect(mInterfaceName, false);
-            // STA has higher priority over P2P
-            mWifiNative.setConcurrencyPriority(true);
-        }
-
-        @Override
-        public boolean processMessage(Message message) {
-            logStateAndMessage(message, this);
-
-            switch(message.what) {
-                case CMD_TARGET_BSSID:
-                    // Trying to associate to this BSSID
-                    if (message.obj != null) {
-                        mTargetRoamBSSID = (String) message.obj;
-                    }
-                    break;
-                case CMD_GET_LINK_LAYER_STATS:
-                    WifiLinkLayerStats stats = getWifiLinkLayerStats();
-                    replyToMessage(message, message.what, stats);
-                    break;
-                case CMD_RESET_SIM_NETWORKS:
-                    log("resetting EAP-SIM/AKA/AKA' networks since SIM was changed");
-                    mWifiConfigManager.resetSimNetworks(message.arg1 == 1);
-                    break;
-                case CMD_BLUETOOTH_ADAPTER_STATE_CHANGE:
-                    mBluetoothConnectionActive = (message.arg1 !=
-                            BluetoothAdapter.STATE_DISCONNECTED);
-                    mWifiNative.setBluetoothCoexistenceScanMode(
-                            mInterfaceName, mBluetoothConnectionActive);
-                    break;
-                case CMD_SET_SUSPEND_OPT_ENABLED:
-                    if (message.arg1 == 1) {
-                        setSuspendOptimizationsNative(SUSPEND_DUE_TO_SCREEN, true);
-                        if (message.arg2 == 1) {
-                            mSuspendWakeLock.release();
-                        }
-                    } else {
-                        setSuspendOptimizationsNative(SUSPEND_DUE_TO_SCREEN, false);
-                    }
-                    break;
-                case CMD_SET_HIGH_PERF_MODE:
-                    if (message.arg1 == 1) {
-                        setSuspendOptimizationsNative(SUSPEND_DUE_TO_HIGH_PERF, false);
-                    } else {
-                        setSuspendOptimizationsNative(SUSPEND_DUE_TO_HIGH_PERF, true);
-                    }
-                    break;
-                case CMD_ENABLE_TDLS:
-                    if (message.obj != null) {
-                        String remoteAddress = (String) message.obj;
-                        boolean enable = (message.arg1 == 1);
-                        mWifiNative.startTdls(mInterfaceName, remoteAddress, enable);
-                    }
-                    break;
-                case WifiMonitor.ANQP_DONE_EVENT:
-                    // TODO(zqiu): remove this when switch over to wificond for ANQP requests.
-                    mPasspointManager.notifyANQPDone((AnqpEvent) message.obj);
-                    break;
-                case CMD_STOP_IP_PACKET_OFFLOAD: {
-                    int slot = message.arg1;
-                    int ret = stopWifiIPPacketOffload(slot);
-                    if (mNetworkAgent != null) {
-                        mNetworkAgent.onPacketKeepaliveEvent(slot, ret);
-                    }
-                    break;
-                }
-                case WifiMonitor.RX_HS20_ANQP_ICON_EVENT:
-                    // TODO(zqiu): remove this when switch over to wificond for icon requests.
-                    mPasspointManager.notifyIconDone((IconEvent) message.obj);
-                    break;
-                case WifiMonitor.HS20_REMEDIATION_EVENT:
-                    // TODO(zqiu): remove this when switch over to wificond for WNM frames
-                    // monitoring.
-                    mPasspointManager.receivedWnmFrame((WnmData) message.obj);
-                    break;
-                case CMD_CONFIG_ND_OFFLOAD:
-                    final boolean enabled = (message.arg1 > 0);
-                    mWifiNative.configureNeighborDiscoveryOffload(mInterfaceName, enabled);
-                    break;
-                case CMD_ENABLE_WIFI_CONNECTIVITY_MANAGER:
-                    mWifiConnectivityManager.enable(message.arg1 == 1 ? true : false);
-                    break;
-                case CMD_SELECT_TX_POWER_SCENARIO:
-                    int txPowerScenario = message.arg1;
-                    logd("Setting Tx power scenario to " + txPowerScenario);
-                    if (!mWifiNative.selectTxPowerScenario(txPowerScenario)) {
-                        loge("Failed to set TX power scenario");
-                    }
-                    break;
-                default:
-                    return NOT_HANDLED;
-            }
-            return HANDLED;
-        }
-
-        @Override
-        public void exit() {
-            setWifiState(WIFI_STATE_DISABLING);
-            // when client mode is moved to WSMP, cleanup will be done on exit.  For now, cleanup is
-            // done when entering a mode.
-
-            // exiting supplicant started state is now only applicable to client mode
-            mWifiDiagnostics.stopLogging();
-
-            if (mP2pSupported) {
-                 // we are not going to wait for a response - will still temporarily send the
-                 // disable command until p2p can detect the interface up/down on its own.
-                p2pSendMessage(WifiStateMachine.CMD_DISABLE_P2P_REQ);
-            }
-
-            handleNetworkDisconnect();
-
-            mIsRunning = false;
-            updateBatteryWorkSource(null);
-
-            mNetworkInfo.setIsAvailable(false);
-            if (mNetworkAgent != null) mNetworkAgent.sendNetworkInfo(mNetworkInfo);
-            mCountryCode.setReadyForChange(false);
-            setWifiState(WIFI_STATE_DISABLED);
-        }
-    }
-
-    class ScanModeState extends State {
-        private int mLastOperationMode;
-        @Override
-        public void enter() {
-            logd("entering ScanModeState");
-            mWifiStateTracker.updateState(WifiStateTracker.SCAN_MODE);
-        }
-
-        @Override
-        public void exit() {}
-
-        @Override
-        public boolean processMessage(Message message) {
-            logStateAndMessage(message, this);
-
-            if (message.what == CMD_SET_OPERATIONAL_MODE) {
-                int operationMode = message.arg1;
-                if (operationMode == SCAN_ONLY_MODE
-                        || operationMode == SCAN_ONLY_WITH_WIFI_OFF_MODE) {
-                    // nothing to do, stay here...
-                    return HANDLED;
-                }
-                return NOT_HANDLED;
-            }
-            return NOT_HANDLED;
-        }
-    }
-
 
     String smToString(Message message) {
         return smToString(message.what);
@@ -4138,6 +3675,107 @@ public class WifiStateMachine extends StateMachine {
         return s;
     }
 
+    /**
+     * Helper method to start other services and get state ready for client mode
+     */
+    private void setupClientMode() {
+        Log.d(TAG, "setupClientMode() ifacename = " + mInterfaceName);
+        mWifiStateTracker.updateState(WifiStateTracker.INVALID);
+
+        if (mWifiConnectivityManager == null) {
+            synchronized (mWifiReqCountLock) {
+                mWifiConnectivityManager =
+                        mWifiInjector.makeWifiConnectivityManager(mWifiInfo,
+                                                                  hasConnectionRequests());
+                mWifiConnectivityManager.setUntrustedConnectionAllowed(mUntrustedReqCount > 0);
+                mWifiConnectivityManager.handleScreenStateChanged(mScreenOn);
+            }
+        }
+
+        mIpClient = mFacade.makeIpClient(mContext, mInterfaceName, new IpClientCallback());
+        mIpClient.setMulticastFilter(true);
+        registerForWifiMonitorEvents();
+        mWifiInjector.getWifiLastResortWatchdog().clearAllFailureCounts();
+        setSupplicantLogLevel();
+
+        // reset state related to supplicant starting
+        mSupplicantStateTracker.sendMessage(CMD_RESET_SUPPLICANT_STATE);
+        // Initialize data structures
+        mLastBssid = null;
+        mLastNetworkId = WifiConfiguration.INVALID_NETWORK_ID;
+        mLastSignalLevel = -1;
+        mWifiInfo.setMacAddress(mWifiNative.getMacAddress(mInterfaceName));
+        // Attempt to migrate data out of legacy store.
+        if (!mWifiConfigManager.migrateFromLegacyStore()) {
+            Log.e(TAG, "Failed to migrate from legacy config store");
+        }
+        sendSupplicantConnectionChangedBroadcast(true);
+
+        mWifiNative.setExternalSim(mInterfaceName, true);
+
+        setRandomMacOui();
+        mCountryCode.setReadyForChange(true);
+
+        mWifiDiagnostics.startLogging(mVerboseLoggingEnabled);
+        mIsRunning = true;
+        updateBatteryWorkSource(null);
+
+        /**
+         * Enable bluetooth coexistence scan mode when bluetooth connection is active.
+         * When this mode is on, some of the low-level scan parameters used by the
+         * driver are changed to reduce interference with bluetooth
+         */
+        mWifiNative.setBluetoothCoexistenceScanMode(mInterfaceName, mBluetoothConnectionActive);
+
+        // initialize network state
+        setNetworkDetailedState(DetailedState.DISCONNECTED);
+
+        // Disable legacy multicast filtering, which on some chipsets defaults to enabled.
+        // Legacy IPv6 multicast filtering blocks ICMPv6 router advertisements which breaks IPv6
+        // provisioning. Legacy IPv4 multicast filtering may be re-enabled later via
+        // IpClient.Callback.setFallbackMulticastFilter()
+        mWifiNative.stopFilteringMulticastV4Packets(mInterfaceName);
+        mWifiNative.stopFilteringMulticastV6Packets(mInterfaceName);
+
+        // Set the right suspend mode settings
+        mWifiNative.setSuspendOptimizations(mInterfaceName, mSuspendOptNeedsDisabled == 0
+                && mUserWantsSuspendOpt.get());
+
+        mWifiNative.setPowerSave(mInterfaceName, true);
+
+        if (mP2pSupported) {
+            p2pSendMessage(WifiStateMachine.CMD_ENABLE_P2P);
+        }
+
+        // Disable wpa_supplicant from auto reconnecting.
+        mWifiNative.enableStaAutoReconnect(mInterfaceName, false);
+        // STA has higher priority over P2P
+        mWifiNative.setConcurrencyPriority(true);
+    }
+
+    /**
+     * Helper method to stop external services and clean up state from client mode.
+     */
+    private void stopClientMode() {
+        // exiting supplicant started state is now only applicable to client mode
+        mWifiDiagnostics.stopLogging();
+
+        if (mP2pSupported) {
+            // we are not going to wait for a response - will still temporarily send the
+            // disable command until p2p can detect the interface up/down on its own.
+            p2pSendMessage(WifiStateMachine.CMD_DISABLE_P2P_REQ);
+        }
+
+        mIsRunning = false;
+        updateBatteryWorkSource(null);
+
+        if (mIpClient != null) mIpClient.shutdown();
+        mNetworkInfo.setIsAvailable(false);
+        if (mNetworkAgent != null) mNetworkAgent.sendNetworkInfo(mNetworkInfo);
+        mCountryCode.setReadyForChange(false);
+        mInterfaceName = null;
+    }
+
     void registerConnected() {
         if (mLastNetworkId != WifiConfiguration.INVALID_NETWORK_ID) {
             mWifiConfigManager.updateNetworkAfterConnect(mLastNetworkId);
@@ -4198,15 +3836,15 @@ public class WifiStateMachine extends StateMachine {
 
         @Override
         public void enter() {
+            Log.d(TAG, "entering ConnectModeState: ifaceName = " + mInterfaceName);
+            mOperationalMode = CONNECT_MODE;
+            setupClientMode();
             if (!mWifiNative.removeAllNetworks(mInterfaceName)) {
                 loge("Failed to remove networks on entering connect mode");
             }
             mScanRequestProxy.enableScanningForHiddenNetworks(true);
             mWifiInfo.reset();
             mWifiInfo.setSupplicantState(SupplicantState.DISCONNECTED);
-            sendWifiScanAvailable(true);
-            // Let the system know that wifi is available in client mode.
-            setWifiState(WIFI_STATE_ENABLED);
 
             mWifiInjector.getWakeupController().reset();
 
@@ -4222,10 +3860,13 @@ public class WifiStateMachine extends StateMachine {
             mWifiMetrics.setWifiState(WifiMetricsProto.WifiLog.WIFI_DISCONNECTED);
             // Inform p2p service that wifi is up and ready when applicable
             p2pSendMessage(WifiStateMachine.CMD_ENABLE_P2P);
+            // Inform sar manager that wifi is Enabled
+            mSarManager.setClientWifiState(WifiManager.WIFI_STATE_ENABLED);
         }
 
         @Override
         public void exit() {
+            mOperationalMode = DISABLED_MODE;
             // Let the system know that wifi is not available since we are exiting client mode.
             mNetworkInfo.setIsAvailable(false);
             if (mNetworkAgent != null) mNetworkAgent.sendNetworkInfo(mNetworkInfo);
@@ -4234,6 +3875,8 @@ public class WifiStateMachine extends StateMachine {
             mWifiConnectivityManager.setWifiEnabled(false);
             // Inform metrics that Wifi is being disabled (Toggled, airplane enabled, etc)
             mWifiMetrics.setWifiState(WifiMetricsProto.WifiLog.WIFI_DISABLED);
+            // Inform sar manager that wifi is being disabled
+            mSarManager.setClientWifiState(WifiManager.WIFI_STATE_DISABLED);
 
             if (!mWifiNative.removeAllNetworks(mInterfaceName)) {
                 loge("Failed to remove networks on exiting connect mode");
@@ -4243,7 +3886,7 @@ public class WifiStateMachine extends StateMachine {
             mScanRequestProxy.clearScanResults();
             mWifiInfo.reset();
             mWifiInfo.setSupplicantState(SupplicantState.DISCONNECTED);
-            setWifiState(WIFI_STATE_DISABLED);
+            stopClientMode();
         }
 
         @Override
@@ -4352,18 +3995,6 @@ public class WifiStateMachine extends StateMachine {
                         mIpClient.confirmConfiguration();
                         mWifiScoreReport.noteIpCheck();
                     }
-
-                    if (!SupplicantState.isDriverActive(state)) {
-                        // still use supplicant to detect interface down while work to
-                        // mitigate b/77218676 is in progress
-                        // note: explicitly using this command to dedup iface down notification
-                        // paths (onUpChanged filters out duplicate updates)
-                        sendMessage(CMD_INTERFACE_STATUS_CHANGED, 0);
-                        if (mVerboseLoggingEnabled) {
-                            Log.d(TAG, "detected interface down via supplicant");
-                        }
-                    }
-
                     break;
                 case WifiP2pServiceImpl.DISCONNECT_WIFI_REQUEST:
                     if (message.arg1 == 1) {
@@ -4788,6 +4419,78 @@ public class WifiStateMachine extends StateMachine {
                     replyToMessage(message, message.what,
                             mPasspointManager.getAllMatchingWifiConfigs((ScanResult) message.obj));
                     break;
+                case CMD_TARGET_BSSID:
+                    // Trying to associate to this BSSID
+                    if (message.obj != null) {
+                        mTargetRoamBSSID = (String) message.obj;
+                    }
+                    break;
+                case CMD_GET_LINK_LAYER_STATS:
+                    WifiLinkLayerStats stats = getWifiLinkLayerStats();
+                    replyToMessage(message, message.what, stats);
+                    break;
+                case CMD_RESET_SIM_NETWORKS:
+                    log("resetting EAP-SIM/AKA/AKA' networks since SIM was changed");
+                    mWifiConfigManager.resetSimNetworks(message.arg1 == 1);
+                    break;
+                case CMD_BLUETOOTH_ADAPTER_STATE_CHANGE:
+                    mBluetoothConnectionActive = (message.arg1
+                            != BluetoothAdapter.STATE_DISCONNECTED);
+                    mWifiNative.setBluetoothCoexistenceScanMode(
+                            mInterfaceName, mBluetoothConnectionActive);
+                    break;
+                case CMD_SET_SUSPEND_OPT_ENABLED:
+                    if (message.arg1 == 1) {
+                        setSuspendOptimizationsNative(SUSPEND_DUE_TO_SCREEN, true);
+                        if (message.arg2 == 1) {
+                            mSuspendWakeLock.release();
+                        }
+                    } else {
+                        setSuspendOptimizationsNative(SUSPEND_DUE_TO_SCREEN, false);
+                    }
+                    break;
+                case CMD_SET_HIGH_PERF_MODE:
+                    if (message.arg1 == 1) {
+                        setSuspendOptimizationsNative(SUSPEND_DUE_TO_HIGH_PERF, false);
+                    } else {
+                        setSuspendOptimizationsNative(SUSPEND_DUE_TO_HIGH_PERF, true);
+                    }
+                    break;
+                case CMD_ENABLE_TDLS:
+                    if (message.obj != null) {
+                        String remoteAddress = (String) message.obj;
+                        boolean enable = (message.arg1 == 1);
+                        mWifiNative.startTdls(mInterfaceName, remoteAddress, enable);
+                    }
+                    break;
+                case WifiMonitor.ANQP_DONE_EVENT:
+                    // TODO(zqiu): remove this when switch over to wificond for ANQP requests.
+                    mPasspointManager.notifyANQPDone((AnqpEvent) message.obj);
+                    break;
+                case CMD_STOP_IP_PACKET_OFFLOAD: {
+                    int slot = message.arg1;
+                    int ret = stopWifiIPPacketOffload(slot);
+                    if (mNetworkAgent != null) {
+                        mNetworkAgent.onPacketKeepaliveEvent(slot, ret);
+                    }
+                    break;
+                }
+                case WifiMonitor.RX_HS20_ANQP_ICON_EVENT:
+                    // TODO(zqiu): remove this when switch over to wificond for icon requests.
+                    mPasspointManager.notifyIconDone((IconEvent) message.obj);
+                    break;
+                case WifiMonitor.HS20_REMEDIATION_EVENT:
+                    // TODO(zqiu): remove this when switch over to wificond for WNM frames
+                    // monitoring.
+                    mPasspointManager.receivedWnmFrame((WnmData) message.obj);
+                    break;
+                case CMD_CONFIG_ND_OFFLOAD:
+                    final boolean enabled = (message.arg1 > 0);
+                    mWifiNative.configureNeighborDiscoveryOffload(mInterfaceName, enabled);
+                    break;
+                case CMD_ENABLE_WIFI_CONNECTIVITY_MANAGER:
+                    mWifiConnectivityManager.enable(message.arg1 == 1 ? true : false);
+                    break;
                 default:
                     return NOT_HANDLED;
             }
@@ -4800,6 +4503,10 @@ public class WifiStateMachine extends StateMachine {
     }
 
     private void updateCapabilities(WifiConfiguration config) {
+        if (mNetworkAgent == null) {
+            return;
+        }
+
         final NetworkCapabilities result = new NetworkCapabilities(mDfltNetworkCapabilities);
 
         if (mWifiInfo != null && !mWifiInfo.isEphemeral()) {
@@ -4820,9 +4527,13 @@ public class WifiStateMachine extends StateMachine {
             result.setSignalStrength(NetworkCapabilities.SIGNAL_STRENGTH_UNSPECIFIED);
         }
 
-        if (mNetworkAgent != null) {
-            mNetworkAgent.sendNetworkCapabilities(result);
+        if (mWifiInfo != null && !mWifiInfo.getSSID().equals(WifiSsid.NONE)) {
+            result.setSSID(mWifiInfo.getSSID());
+        } else {
+            result.setSSID(null);
         }
+
+        mNetworkAgent.sendNetworkCapabilities(result);
     }
 
     /**
@@ -5131,6 +4842,7 @@ public class WifiStateMachine extends StateMachine {
                     if (mVerboseLoggingEnabled && message.obj != null) log((String) message.obj);
                     if (mIpReachabilityDisconnectEnabled) {
                         handleIpReachabilityLost();
+                        mWifiDiagnostics.captureBugReportData(WifiDiagnostics.REPORT_REASON_NUD_FAILURE);
                         transitionTo(mDisconnectingState);
                     } else {
                         logd("CMD_IP_REACHABILITY_LOST but disconnect disabled -- ignore");
@@ -5308,6 +5020,15 @@ public class WifiStateMachine extends StateMachine {
             // cause the roam to fail and the device to disconnect.
             clearTargetBssid("ObtainingIpAddress");
 
+            // Reset power save mode after association.
+            // Kernel does not forward power save request to driver if power
+            // save state of that interface is same as requested state in
+            // cfg80211. This happens when driver’s power save state not
+            // synchronized with cfg80211 power save state.
+            // By resetting power save state resolves issues of cfg80211
+            // ignoring enable power save request sent in ObtainingIpState.
+            mWifiNative.setPowerSave(mInterfaceName, false);
+
             // Stop IpClient in case we're switching from DHCP to static
             // configuration or vice versa.
             //
@@ -5325,10 +5046,17 @@ public class WifiStateMachine extends StateMachine {
                 mIpClient.setTcpBufferSizes(mTcpBufferSizes);
             }
             final IpClient.ProvisioningConfiguration prov;
+
+            ApfCapabilities apfCapabilities = mWifiNative.getApfCapabilities(mInterfaceName);
+            if (mContext.getPackageManager().hasSystemFeature(PackageManager.FEATURE_AUTOMOTIVE)) {
+                // Temporarily disable APF on automotive platforms to work around b/78905546.
+                apfCapabilities = null;
+            }
+
             if (!isUsingStaticIp) {
                 prov = IpClient.buildProvisioningConfiguration()
                             .withPreDhcpAction()
-                            .withApfCapabilities(mWifiNative.getApfCapabilities(mInterfaceName))
+                            .withApfCapabilities(apfCapabilities)
                             .withNetwork(getCurrentNetwork())
                             .withDisplayName(currentConfig.SSID)
                             .withRandomMacAddress()
@@ -5337,7 +5065,7 @@ public class WifiStateMachine extends StateMachine {
                 StaticIpConfiguration staticIpConfig = currentConfig.getStaticIpConfiguration();
                 prov = IpClient.buildProvisioningConfiguration()
                             .withStaticConfiguration(staticIpConfig)
-                            .withApfCapabilities(mWifiNative.getApfCapabilities(mInterfaceName))
+                            .withApfCapabilities(apfCapabilities)
                             .withNetwork(getCurrentNetwork())
                             .withDisplayName(currentConfig.SSID)
                             .build();
@@ -5887,118 +5615,9 @@ public class WifiStateMachine extends StateMachine {
         }
     }
 
-    class SoftApState extends State {
-        private SoftApManager mSoftApManager;
-        private String mIfaceName;
-        private int mMode;
-
-        /*
-        private class SoftApCallbackImpl implements WifiManager.SoftApCallback {
-            @Override
-            public void onStateChanged(int state, int reason) {
-                if (state == WIFI_AP_STATE_DISABLED) {
-                    sendMessage(CMD_AP_STOPPED);
-                } else if (state == WIFI_AP_STATE_FAILED) {
-                    sendMessage(CMD_START_AP_FAILURE);
-                }
-
-                setWifiApState(state, reason, mIfaceName, mMode);
-
-                if (mSoftApCallback != null) {
-                    mSoftApCallback.onStateChanged(state, reason);
-                }
-            }
-
-            @Override
-            public void onNumClientsChanged(int numClients) {
-                if (mSoftApCallback != null) {
-                    mSoftApCallback.onNumClientsChanged(numClients);
-                }
-            }
-        }
-        */
-
-        @Override
-        public void enter() {
-            final Message message = getCurrentMessage();
-            if (message.what != CMD_START_AP) {
-                throw new RuntimeException("Illegal transition to SoftApState: " + message);
-            }
-            /*
-            SoftApModeConfiguration config = (SoftApModeConfiguration) message.obj;
-            mMode = config.getTargetMode();
-
-            IApInterface apInterface = null;
-            Pair<Integer, IApInterface> statusAndInterface =
-                    mWifiNative.setupForSoftApMode(mInterfaceName);
-            if (statusAndInterface.first == WifiNative.SETUP_SUCCESS) {
-                apInterface = statusAndInterface.second;
-            } else {
-                incrementMetricsForSetupFailure(statusAndInterface.first);
-            }
-            if (apInterface == null) {
-                setWifiApState(WIFI_AP_STATE_FAILED,
-                        WifiManager.SAP_START_FAILURE_GENERAL, null, mMode);
-                // Transition to InitialState to reset the driver/HAL back to the initial state.
-                transitionTo(mInitialState);
-                return;
-            }
-
-            try {
-                mIfaceName = apInterface.getInterfaceName();
-            } catch (RemoteException e) {
-                // Failed to get the interface name. This is not a good sign and we should report
-                // a failure and switch back to the initial state to reset the driver and HAL.
-                setWifiApState(WIFI_AP_STATE_FAILED,
-                        WifiManager.SAP_START_FAILURE_GENERAL, null, mMode);
-                transitionTo(mInitialState);
-                return;
-            }
-
-            checkAndSetConnectivityInstance();
-            mSoftApManager = mWifiInjector.makeSoftApManager(mNwService,
-                                                             new SoftApCallbackImpl(),
-                                                             config);
-            mSoftApManager.start();
-            mWifiStateTracker.updateState(WifiStateTracker.SOFT_AP);
-            */
-        }
-
-        @Override
-        public void exit() {
-            mSoftApManager = null;
-            mIfaceName = null;
-            mMode = WifiManager.IFACE_IP_MODE_UNSPECIFIED;
-        }
-
-        @Override
-        public boolean processMessage(Message message) {
-            logStateAndMessage(message, this);
-
-            switch(message.what) {
-                case CMD_START_AP:
-                    /* Ignore start command when it is starting/started. */
-                    break;
-                case CMD_STOP_AP:
-                    //mSoftApManager.stop();
-                    transitionTo(mDefaultState);
-                    break;
-                case CMD_START_AP_FAILURE:
-                    transitionTo(mDefaultState);
-                    break;
-                case CMD_AP_STOPPED:
-                    transitionTo(mDefaultState);
-                    break;
-                default:
-                    return NOT_HANDLED;
-            }
-            return HANDLED;
-        }
-    }
-
     /**
-     * State machine initiated requests can have replyTo set to null indicating
-     * there are no recepients, we ignore those reply actions.
+     * State machine initiated requests can have replyTo set to null, indicating
+     * there are no recipients, we ignore those reply actions.
      */
     private void replyToMessage(Message msg, int what) {
         if (msg.replyTo == null) return;
