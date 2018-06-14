@@ -29,6 +29,9 @@ import com.android.internal.util.State;
 import com.android.internal.util.StateMachine;
 import com.android.server.wifi.WifiNative.InterfaceCallback;
 
+import java.io.FileDescriptor;
+import java.io.PrintWriter;
+
 /**
  * Manager WiFi in Scan Only Mode - no network connections.
  */
@@ -47,6 +50,9 @@ public class ScanOnlyModeManager implements ActiveModeManager {
     private final WakeupController mWakeupController;
 
     private String mClientInterfaceName;
+    private boolean mIfaceIsUp = false;
+
+    private boolean mExpectedStop = false;
 
     ScanOnlyModeManager(@NonNull Context context, @NonNull Looper looper,
                         @NonNull WifiNative wifiNative, @NonNull Listener listener,
@@ -73,9 +79,20 @@ public class ScanOnlyModeManager implements ActiveModeManager {
      * Cancel any pending scans and stop scan mode.
      */
     public void stop() {
-        IState currentState = mStateMachine.getCurrentState();
-        Log.d(TAG, " currentstate: " + currentState);
+        Log.d(TAG, " currentstate: " + getCurrentStateName());
+        mExpectedStop = true;
         mStateMachine.quitNow();
+    }
+
+    /**
+     * Dump info about this ScanOnlyMode manager.
+     */
+    public void dump(FileDescriptor fd, PrintWriter pw, String[] args) {
+        pw.println("--Dump of ScanOnlyModeManager--");
+
+        pw.println("current StateMachine mode: " + getCurrentStateName());
+        pw.println("mClientInterfaceName: " + mClientInterfaceName);
+        pw.println("mIfaceIsUp: " + mIfaceIsUp);
     }
 
     /**
@@ -89,11 +106,33 @@ public class ScanOnlyModeManager implements ActiveModeManager {
         void onStateChanged(int state);
     }
 
+    private String getCurrentStateName() {
+        IState currentState = mStateMachine.getCurrentState();
+
+        if (currentState != null) {
+            return currentState.getName();
+        }
+
+        return "StateMachine not active";
+    }
+
     /**
      * Update Wifi state.
      * @param state new Wifi state
      */
     private void updateWifiState(int state) {
+        if (mExpectedStop) {
+            Log.d(TAG, "expected stop, not triggering callbacks: state = " + state);
+            return;
+        }
+
+        // Once we report the mode has stopped/failed any other stop signals are redundant
+        // note: this can happen in failure modes where we get multiple callbacks as underlying
+        // components/interface stops or the underlying interface is destroyed in cleanup
+        if (state == WifiManager.WIFI_STATE_UNKNOWN || state == WifiManager.WIFI_STATE_DISABLED) {
+            mExpectedStop = true;
+        }
+
         mListener.onStateChanged(state);
     }
 
@@ -129,7 +168,6 @@ public class ScanOnlyModeManager implements ActiveModeManager {
                 }
             }
         };
-        private boolean mIfaceIsUp = false;
 
         ScanOnlyModeStateMachine(Looper looper) {
             super(TAG, looper);
@@ -161,8 +199,13 @@ public class ScanOnlyModeManager implements ActiveModeManager {
                             break;
                         }
                         // we have a new scanning interface, make sure scanner knows we aren't
-                        // ready yet
+                        // ready yet and clear out the ScanRequestProxy
                         sendScanAvailableBroadcast(false);
+                        // explicitly disable scanning for hidden networks in case we were
+                        // previously in client mode
+                        mScanRequestProxy.enableScanningForHiddenNetworks(false);
+                        mScanRequestProxy.clearScanResults();
+
                         transitionTo(mStartedState);
                         break;
                     default:
@@ -228,19 +271,19 @@ public class ScanOnlyModeManager implements ActiveModeManager {
             }
 
             /**
-             * Clean up state, unregister listeners and send broadcast to tell WifiScanner
-             * that wifi is disabled.
+             * Clean up state and unregister listeners.
              */
             @Override
             public void exit() {
                 mWakeupController.stop();
-                if (mClientInterfaceName == null) {
-                    return;
+                if (mClientInterfaceName != null) {
+                    mWifiNative.teardownInterface(mClientInterfaceName);
+                    mClientInterfaceName = null;
                 }
-                mWifiNative.teardownInterface(mClientInterfaceName);
-                mClientInterfaceName = null;
                 updateWifiState(WifiManager.WIFI_STATE_DISABLED);
-                mScanRequestProxy.clearScanResults();
+
+                // once we leave started, nothing else to do...  stop the state machine
+                mStateMachine.quitNow();
             }
         }
     }

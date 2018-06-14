@@ -50,6 +50,10 @@ import com.android.server.wifi.rtt.RttMetrics;
 import com.android.server.wifi.util.InformationElementUtil;
 import com.android.server.wifi.util.ScanResultUtil;
 
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
 import java.util.ArrayList;
@@ -109,6 +113,7 @@ public class WifiMetrics {
     private final PnoScanMetrics mPnoScanMetrics = new PnoScanMetrics();
     private final WpsMetrics mWpsMetrics = new WpsMetrics();
     private Handler mHandler;
+    private ScoringParams mScoringParams;
     private WifiConfigManager mWifiConfigManager;
     private WifiNetworkSelector mWifiNetworkSelector;
     private PasspointManager mPasspointManager;
@@ -136,8 +141,8 @@ public class WifiMetrics {
      * combination. Indexed by WifiLog.WifiState * (1 + screenOn)
      */
     private final SparseIntArray mWifiSystemStateEntries = new SparseIntArray();
-    /** Mapping of RSSI values to counts. */
-    private final SparseIntArray mRssiPollCounts = new SparseIntArray();
+    /** Mapping of channel frequency to its RSSI distribution histogram **/
+    private final Map<Integer, SparseIntArray> mRssiPollCountsMap = new HashMap<>();
     /** Mapping of RSSI scan-poll delta values to counts. */
     private final SparseIntArray mRssiDeltaCounts = new SparseIntArray();
     /** RSSI of the scan result for the last connection event*/
@@ -197,6 +202,8 @@ public class WifiMetrics {
 
     /** Wifi Wake metrics */
     private final WifiWakeMetrics mWifiWakeMetrics = new WifiWakeMetrics();
+
+    private boolean mIsMacRandomizationOn = false;
 
     class RouterFingerPrint {
         private WifiMetricsProto.RouterFingerPrint mRouterFingerPrintProto;
@@ -448,6 +455,11 @@ public class WifiMetrics {
                 }
             }
         };
+    }
+
+    /** Sets internal ScoringParams member */
+    public void setScoringParams(ScoringParams scoringParams) {
+        mScoringParams = scoringParams;
     }
 
     /** Sets internal WifiConfigManager member */
@@ -1087,20 +1099,26 @@ public class WifiMetrics {
         mLastPollRssi = wifiInfo.getRssi();
         mLastPollLinkSpeed = wifiInfo.getLinkSpeed();
         mLastPollFreq = wifiInfo.getFrequency();
-        incrementRssiPollRssiCount(mLastPollRssi);
+        incrementRssiPollRssiCount(mLastPollFreq, mLastPollRssi);
     }
 
     /**
-     * Increment occurence count of RSSI level from RSSI poll.
-     * Ignores rssi values outside the bounds of [MIN_RSSI_POLL, MAX_RSSI_POLL]
+     * Increment occurence count of RSSI level from RSSI poll for the given frequency.
+     * @param frequency (MHz)
+     * @param rssi
      */
-    public void incrementRssiPollRssiCount(int rssi) {
+    @VisibleForTesting
+    public void incrementRssiPollRssiCount(int frequency, int rssi) {
         if (!(rssi >= MIN_RSSI_POLL && rssi <= MAX_RSSI_POLL)) {
             return;
         }
         synchronized (mLock) {
-            int count = mRssiPollCounts.get(rssi);
-            mRssiPollCounts.put(rssi, count + 1);
+            if (!mRssiPollCountsMap.containsKey(frequency)) {
+                mRssiPollCountsMap.put(frequency, new SparseIntArray());
+            }
+            SparseIntArray sparseIntArray = mRssiPollCountsMap.get(frequency);
+            int count = sparseIntArray.get(rssi);
+            sparseIntArray.put(rssi, count + 1);
             maybeIncrementRssiDeltaCount(rssi - mScanResultRssi);
         }
     }
@@ -1511,6 +1529,51 @@ public class WifiMetrics {
     }
 
     /**
+     * Increment number of times we detected a radio mode change to MCC.
+     */
+    public void incrementNumRadioModeChangeToMcc() {
+        synchronized (mLock) {
+            mWifiLogProto.numRadioModeChangeToMcc++;
+        }
+    }
+
+    /**
+     * Increment number of times we detected a radio mode change to SCC.
+     */
+    public void incrementNumRadioModeChangeToScc() {
+        synchronized (mLock) {
+            mWifiLogProto.numRadioModeChangeToScc++;
+        }
+    }
+
+    /**
+     * Increment number of times we detected a radio mode change to SBS.
+     */
+    public void incrementNumRadioModeChangeToSbs() {
+        synchronized (mLock) {
+            mWifiLogProto.numRadioModeChangeToSbs++;
+        }
+    }
+
+    /**
+     * Increment number of times we detected a radio mode change to DBS.
+     */
+    public void incrementNumRadioModeChangeToDbs() {
+        synchronized (mLock) {
+            mWifiLogProto.numRadioModeChangeToDbs++;
+        }
+    }
+
+    /**
+     * Increment number of times we detected a channel did not satisfy user band preference.
+     */
+    public void incrementNumSoftApUserBandPreferenceUnsatisfied() {
+        synchronized (mLock) {
+            mWifiLogProto.numSoftApUserBandPreferenceUnsatisfied++;
+        }
+    }
+
+    /**
      * Increment N-Way network selection decision histograms:
      * Counts the size of various sets of scanDetails within a scan, and increment the occurrence
      * of that size for the associated histogram. There are ten histograms generated for each
@@ -1707,6 +1770,13 @@ public class WifiMetrics {
         }
     }
 
+    /** Sets if Connected MAC Randomization feature is enabled */
+    public void setIsMacRandomizationOn(boolean enabled) {
+        synchronized (mLock) {
+            mIsMacRandomizationOn = enabled;
+        }
+    }
+
     public static final String PROTO_DUMP_ARG = "wifiMetricsProto";
     public static final String CLEAN_DUMP_ARG = "clean";
 
@@ -1716,10 +1786,11 @@ public class WifiMetrics {
      *
      * @param fd unused
      * @param pw PrintWriter for writing dump to
-     * @param args unused
+     * @param args [wifiMetricsProto [clean]]
      */
     public void dump(FileDescriptor fd, PrintWriter pw, String[] args) {
         synchronized (mLock) {
+            consolidateScoringParams();
             if (args != null && args.length > 0 && PROTO_DUMP_ARG.equals(args[0])) {
                 // Dump serialized WifiLog proto
                 consolidateProto(true);
@@ -1846,16 +1917,32 @@ public class WifiMetrics {
                         + mWifiLogProto.numLastResortWatchdogSuccesses);
                 pw.println("mWifiLogProto.recordDurationSec="
                         + ((mClock.getElapsedSinceBootMillis() / 1000) - mRecordStartTimeSec));
-                pw.println("mWifiLogProto.rssiPollRssiCount: Printing counts for [" + MIN_RSSI_POLL
-                        + ", " + MAX_RSSI_POLL + "]");
-                StringBuilder sb = new StringBuilder();
-                for (int i = MIN_RSSI_POLL; i <= MAX_RSSI_POLL; i++) {
-                    sb.append(mRssiPollCounts.get(i) + " ");
+
+                try {
+                    JSONObject rssiMap = new JSONObject();
+                    for (Map.Entry<Integer, SparseIntArray> entry : mRssiPollCountsMap.entrySet()) {
+                        int frequency = entry.getKey();
+                        final SparseIntArray histogram = entry.getValue();
+                        JSONArray histogramElements = new JSONArray();
+                        for (int i = MIN_RSSI_POLL; i <= MAX_RSSI_POLL; i++) {
+                            int count = histogram.get(i);
+                            if (count == 0) {
+                                continue;
+                            }
+                            JSONObject histogramElement = new JSONObject();
+                            histogramElement.put(Integer.toString(i), count);
+                            histogramElements.put(histogramElement);
+                        }
+                        rssiMap.put(Integer.toString(frequency), histogramElements);
+                    }
+                    pw.println("mWifiLogProto.rssiPollCount: " + rssiMap.toString());
+                } catch (JSONException e) {
+                    pw.println("JSONException occurred: " + e.getMessage());
                 }
-                pw.println("  " + sb.toString());
+
                 pw.println("mWifiLogProto.rssiPollDeltaCount: Printing counts for ["
                         + MIN_RSSI_DELTA + ", " + MAX_RSSI_DELTA + "]");
-                sb.setLength(0);
+                StringBuilder sb = new StringBuilder();
                 for (int i = MIN_RSSI_DELTA; i <= MAX_RSSI_DELTA; i++) {
                     sb.append(mRssiDeltaCounts.get(i) + " ");
                 }
@@ -1941,6 +2028,16 @@ public class WifiMetrics {
                         + mWifiLogProto.numPasspointProviderUninstallSuccess);
                 pw.println("mWifiLogProto.numPasspointProvidersSuccessfullyConnected="
                         + mWifiLogProto.numPasspointProvidersSuccessfullyConnected);
+                pw.println("mWifiLogProto.numRadioModeChangeToMcc="
+                        + mWifiLogProto.numRadioModeChangeToMcc);
+                pw.println("mWifiLogProto.numRadioModeChangeToScc="
+                        + mWifiLogProto.numRadioModeChangeToScc);
+                pw.println("mWifiLogProto.numRadioModeChangeToSbs="
+                        + mWifiLogProto.numRadioModeChangeToSbs);
+                pw.println("mWifiLogProto.numRadioModeChangeToDbs="
+                        + mWifiLogProto.numRadioModeChangeToDbs);
+                pw.println("mWifiLogProto.numSoftApUserBandPreferenceUnsatisfied="
+                        + mWifiLogProto.numSoftApUserBandPreferenceUnsatisfied);
                 pw.println("mTotalSsidsInScanHistogram:"
                         + mTotalSsidsInScanHistogram.toString());
                 pw.println("mTotalBssidsInScanHistogram:"
@@ -2050,6 +2147,9 @@ public class WifiMetrics {
 
                 mWifiPowerMetrics.dump(pw);
                 mWifiWakeMetrics.dump(pw);
+
+                pw.println("mWifiLogProto.isMacRandomizationOn=" + mIsMacRandomizationOn);
+                pw.println("mWifiLogProto.scoreExperimentId=" + mWifiLogProto.scoreExperimentId);
             }
         }
     }
@@ -2164,14 +2264,19 @@ public class WifiMetrics {
                     - mRecordStartTimeSec);
 
             /**
-             * Convert the SparseIntArray of RSSI poll rssi's and counts to the proto's repeated
-             * IntKeyVal array.
+             * Convert the SparseIntArrays of RSSI poll rssi, counts, and frequency to the
+             * proto's repeated ntKeyVal array.
              */
-            for (int i = 0; i < mRssiPollCounts.size(); i++) {
-                WifiMetricsProto.RssiPollCount keyVal = new WifiMetricsProto.RssiPollCount();
-                keyVal.rssi = mRssiPollCounts.keyAt(i);
-                keyVal.count = mRssiPollCounts.valueAt(i);
-                rssis.add(keyVal);
+            for (Map.Entry<Integer, SparseIntArray> entry : mRssiPollCountsMap.entrySet()) {
+                int frequency = entry.getKey();
+                SparseIntArray histogram = entry.getValue();
+                for (int i = 0; i < histogram.size(); i++) {
+                    WifiMetricsProto.RssiPollCount keyVal = new WifiMetricsProto.RssiPollCount();
+                    keyVal.rssi = histogram.keyAt(i);
+                    keyVal.count = histogram.valueAt(i);
+                    keyVal.frequency = frequency;
+                    rssis.add(keyVal);
+                }
             }
             mWifiLogProto.rssiPollRssiCount = rssis.toArray(mWifiLogProto.rssiPollRssiCount);
 
@@ -2186,6 +2291,8 @@ public class WifiMetrics {
                 rssiDeltas.add(keyVal);
             }
             mWifiLogProto.rssiPollDeltaCount = rssiDeltas.toArray(mWifiLogProto.rssiPollDeltaCount);
+
+
 
             /**
              * Convert the SparseIntArray of alert reasons and counts to the proto's repeated
@@ -2341,6 +2448,21 @@ public class WifiMetrics {
             mWifiLogProto.wpsMetrics = mWpsMetrics;
             mWifiLogProto.wifiPowerStats = mWifiPowerMetrics.buildProto();
             mWifiLogProto.wifiWakeStats = mWifiWakeMetrics.buildProto();
+            mWifiLogProto.isMacRandomizationOn = mIsMacRandomizationOn;
+        }
+    }
+
+    /** Sets the scoring experiment id to current value */
+    private void consolidateScoringParams() {
+        synchronized (mLock) {
+            if (mScoringParams != null) {
+                int experimentIdentifier = mScoringParams.getExperimentIdentifier();
+                if (experimentIdentifier == 0) {
+                    mWifiLogProto.scoreExperimentId = "";
+                } else {
+                    mWifiLogProto.scoreExperimentId = "x" + experimentIdentifier;
+                }
+            }
         }
     }
 
@@ -2371,7 +2493,7 @@ public class WifiMetrics {
             mScanReturnEntries.clear();
             mWifiSystemStateEntries.clear();
             mRecordStartTimeSec = mClock.getElapsedSinceBootMillis() / 1000;
-            mRssiPollCounts.clear();
+            mRssiPollCountsMap.clear();
             mRssiDeltaCounts.clear();
             mWifiAlertReasonCounts.clear();
             mWifiScoreCounts.clear();
@@ -2532,6 +2654,7 @@ public class WifiMetrics {
             case StaEvent.TYPE_NETWORK_AGENT_VALID_NETWORK:
             case StaEvent.TYPE_FRAMEWORK_DISCONNECT:
             case StaEvent.TYPE_SCORE_BREACH:
+            case StaEvent.TYPE_MAC_CHANGE:
                 break;
             default:
                 Log.e(TAG, "Unknown StaEvent:" + type);
@@ -2723,6 +2846,9 @@ public class WifiMetrics {
                 break;
             case StaEvent.TYPE_SCORE_BREACH:
                 sb.append("SCORE_BREACH");
+                break;
+            case StaEvent.TYPE_MAC_CHANGE:
+                sb.append("MAC_CHANGE");
                 break;
             default:
                 sb.append("UNKNOWN " + event.type + ":");

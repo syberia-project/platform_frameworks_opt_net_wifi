@@ -346,6 +346,11 @@ public class XmlUtil {
         public static final String XML_TAG_ROAMING_CONSORTIUM_OIS = "RoamingConsortiumOIs";
         public static final String XML_TAG_RANDOMIZED_MAC_ADDRESS = "RandomizedMacAddress";
 
+        public static final String XML_TAG_DPP_CONNECTOR = "DppConnector";
+        public static final String XML_TAG_DPP_NETACCESSKEY = "DppNetAccessKey";
+        public static final String XML_TAG_DPP_NETACCESSKEY_EXPIRY = "DppNetAccessKeyExpiry";
+        public static final String XML_TAG_DPP_CSIGN = "DppCsign";
+
         /**
          * Write WepKeys to the XML stream.
          * WepKeys array is intialized in WifiConfiguration constructor, but all of the elements
@@ -465,6 +470,11 @@ public class XmlUtil {
                     out, XML_TAG_ROAMING_CONSORTIUM_OIS, configuration.roamingConsortiumIds);
             XmlUtil.writeNextValue(out, XML_TAG_RANDOMIZED_MAC_ADDRESS,
                     configuration.getRandomizedMacAddress().toString());
+
+            XmlUtil.writeNextValue(out, XML_TAG_DPP_CONNECTOR, configuration.dppConnector);
+            XmlUtil.writeNextValue(out, XML_TAG_DPP_NETACCESSKEY, configuration.dppNetAccessKey);
+            XmlUtil.writeNextValue(out, XML_TAG_DPP_NETACCESSKEY_EXPIRY, configuration.dppNetAccessKeyExpiry);
+            XmlUtil.writeNextValue(out, XML_TAG_DPP_CSIGN, configuration.dppCsign);
         }
 
         /**
@@ -633,6 +643,17 @@ public class XmlUtil {
                     case XML_TAG_RANDOMIZED_MAC_ADDRESS:
                         configuration.setRandomizedMacAddress(
                                 MacAddress.fromString((String) value));
+                    case XML_TAG_DPP_CONNECTOR:
+                        configuration.dppConnector = (String) value;
+                        break;
+                    case XML_TAG_DPP_NETACCESSKEY:
+                        configuration.dppNetAccessKey = (String) value;
+                        break;
+                    case XML_TAG_DPP_NETACCESSKEY_EXPIRY:
+                        configuration.dppNetAccessKeyExpiry = (int) value;
+                        break;
+                    case XML_TAG_DPP_CSIGN:
+                        configuration.dppCsign = (String) value;
                         break;
                     default:
                         throw new XmlPullParserException(
@@ -987,6 +1008,7 @@ public class XmlUtil {
         public static final String XML_TAG_PHASE2_METHOD = "Phase2Method";
         public static final String XML_TAG_PLMN = "PLMN";
         public static final String XML_TAG_REALM = "Realm";
+        public static final String XML_TAG_SIMNUM = "SimNum";
 
         /**
          * Write the WifiEnterpriseConfig data elements from the provided config to the XML
@@ -1025,6 +1047,7 @@ public class XmlUtil {
             XmlUtil.writeNextValue(out, XML_TAG_PHASE2_METHOD, enterpriseConfig.getPhase2Method());
             XmlUtil.writeNextValue(out, XML_TAG_PLMN, enterpriseConfig.getPlmn());
             XmlUtil.writeNextValue(out, XML_TAG_REALM, enterpriseConfig.getRealm());
+            XmlUtil.writeNextValue(out, XML_TAG_SIMNUM, enterpriseConfig.getSimNum());
         }
 
         /**
@@ -1105,6 +1128,17 @@ public class XmlUtil {
                         break;
                     case XML_TAG_REALM:
                         enterpriseConfig.setRealm((String) value);
+                        break;
+                    case XML_TAG_SIMNUM:
+                        int sim_num;
+                        try {
+                            sim_num = Integer.parseInt((String) value);
+                        } catch (NumberFormatException e) {
+                            sim_num = -1;
+                        }
+                        if (sim_num > 0) {
+                            enterpriseConfig.setSimNum(sim_num);
+                        }
                         break;
                     default:
                         throw new XmlPullParserException(

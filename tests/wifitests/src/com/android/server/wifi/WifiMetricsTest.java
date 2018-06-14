@@ -72,6 +72,7 @@ public class WifiMetricsTest {
     WifiMetricsProto.WifiLog mDecodedProto;
     TestLooper mTestLooper;
     @Mock Clock mClock;
+    @Mock ScoringParams mScoringParams;
     @Mock WifiConfigManager mWcm;
     @Mock PasspointManager mPpm;
     @Mock WifiNetworkSelector mWns;
@@ -86,6 +87,7 @@ public class WifiMetricsTest {
                 new WifiAwareMetrics(mClock), new RttMetrics(mClock));
         mWifiMetrics.setWifiConfigManager(mWcm);
         mWifiMetrics.setPasspointManager(mPpm);
+        mWifiMetrics.setScoringParams(mScoringParams);
         mWifiMetrics.setWifiNetworkSelector(mWns);
     }
 
@@ -230,6 +232,7 @@ public class WifiMetricsTest {
     private static final int NUM_LAST_RESORT_WATCHDOG_TRIGGERS_WITH_BAD_OTHER = 10;
     private static final int NUM_LAST_RESORT_WATCHDOG_SUCCESSES = 5;
     private static final int WATCHDOG_TOTAL_CONNECTION_FAILURE_COUNT_AFTER_TRIGGER = 6;
+    private static final int RSSI_POLL_FREQUENCY = 5150;
     private static final int NUM_RSSI_LEVELS_TO_INCREMENT = 20;
     private static final int FIRST_RSSI_LEVEL = -80;
     private static final int NUM_OPEN_NETWORK_SCAN_RESULTS = 1;
@@ -286,6 +289,11 @@ public class WifiMetricsTest {
     private static final int NUM_WPS_OTHER_CONNECTION_FAILURE = 16;
     private static final int NUM_WPS_SUPPLICANT_FAILURE = 12;
     private static final int NUM_WPS_CANCELLATION = 11;
+    private static final int NUM_RADIO_MODE_CHANGE_TO_MCC = 4;
+    private static final int NUM_RADIO_MODE_CHANGE_TO_SCC = 13;
+    private static final int NUM_RADIO_MODE_CHANGE_TO_SBS = 19;
+    private static final int NUM_RADIO_MODE_CHANGE_TO_DBS = 34;
+    private static final int NUM_SOFTAP_USER_BAND_PREFERENCE_UNSATISFIED = 14;
     private static final long NUM_WATCHDOG_SUCCESS_DURATION_MS = 65;
 
     /** Number of notifications per "Connect to Network" notification type. */
@@ -307,6 +315,7 @@ public class WifiMetricsTest {
     private static final int NUM_SOFT_AP_ASSOCIATED_STATIONS = 3;
     private static final int SOFT_AP_CHANNEL_FREQUENCY = 2437;
     private static final int SOFT_AP_CHANNEL_BANDWIDTH = SoftApConnectedClientsEvent.BANDWIDTH_20;
+    private static final boolean IS_MAC_RANDOMIZATION_ON = true;
 
     private ScanDetail buildMockScanDetail(boolean hidden, NetworkDetail.HSRelease hSRelease,
             String capabilities) {
@@ -482,15 +491,16 @@ public class WifiMetricsTest {
         }
         for (int i = 0; i < NUM_RSSI_LEVELS_TO_INCREMENT; i++) {
             for (int j = 0; j <= i; j++) {
-                mWifiMetrics.incrementRssiPollRssiCount(MIN_RSSI_LEVEL + i);
+                mWifiMetrics.incrementRssiPollRssiCount(RSSI_POLL_FREQUENCY, MIN_RSSI_LEVEL + i);
             }
         }
         for (int i = 1; i < NUM_OUT_OF_BOUND_ENTRIES; i++) {
-            mWifiMetrics.incrementRssiPollRssiCount(MIN_RSSI_LEVEL - i);
+            mWifiMetrics.incrementRssiPollRssiCount(RSSI_POLL_FREQUENCY, MIN_RSSI_LEVEL - i);
         }
         for (int i = 1; i < NUM_OUT_OF_BOUND_ENTRIES; i++) {
-            mWifiMetrics.incrementRssiPollRssiCount(MAX_RSSI_LEVEL + i);
+            mWifiMetrics.incrementRssiPollRssiCount(RSSI_POLL_FREQUENCY, MAX_RSSI_LEVEL + i);
         }
+
         // Test alert-reason clamping.
         mWifiMetrics.incrementAlertReasonCount(WifiLoggerHal.WIFI_ALERT_REASON_MIN - 1);
         mWifiMetrics.incrementAlertReasonCount(WifiLoggerHal.WIFI_ALERT_REASON_MAX + 1);
@@ -587,6 +597,21 @@ public class WifiMetricsTest {
         for (int i = 0; i < NUM_PASSPOINT_PROVIDER_UNINSTALL_SUCCESS; i++) {
             mWifiMetrics.incrementNumPasspointProviderUninstallSuccess();
         }
+        for (int i = 0; i < NUM_RADIO_MODE_CHANGE_TO_MCC; i++) {
+            mWifiMetrics.incrementNumRadioModeChangeToMcc();
+        }
+        for (int i = 0; i < NUM_RADIO_MODE_CHANGE_TO_SCC; i++) {
+            mWifiMetrics.incrementNumRadioModeChangeToScc();
+        }
+        for (int i = 0; i < NUM_RADIO_MODE_CHANGE_TO_SBS; i++) {
+            mWifiMetrics.incrementNumRadioModeChangeToSbs();
+        }
+        for (int i = 0; i < NUM_RADIO_MODE_CHANGE_TO_DBS; i++) {
+            mWifiMetrics.incrementNumRadioModeChangeToDbs();
+        }
+        for (int i = 0; i < NUM_SOFTAP_USER_BAND_PREFERENCE_UNSATISFIED; i++) {
+            mWifiMetrics.incrementNumSoftApUserBandPreferenceUnsatisfied();
+        }
 
         // increment pno scan metrics
         for (int i = 0; i < NUM_PNO_SCAN_ATTEMPTS; i++) {
@@ -662,6 +687,7 @@ public class WifiMetricsTest {
         }
 
         mWifiMetrics.setWatchdogSuccessTimeDurationMs(NUM_WATCHDOG_SUCCESS_DURATION_MS);
+        mWifiMetrics.setIsMacRandomizationOn(IS_MAC_RANDOMIZATION_ON);
     }
 
     private void addSoftApEventsToMetrics() {
@@ -789,6 +815,8 @@ public class WifiMetricsTest {
         assertEquals(TEST_RECORD_DURATION_SEC,
                 mDecodedProto.recordDurationSec);
         for (int i = 0; i < NUM_RSSI_LEVELS_TO_INCREMENT; i++) {
+            assertEquals(RSSI_POLL_FREQUENCY,
+                    mDecodedProto.rssiPollRssiCount[i].frequency);
             assertEquals(MIN_RSSI_LEVEL + i, mDecodedProto.rssiPollRssiCount[i].rssi);
             assertEquals(i + 1, mDecodedProto.rssiPollRssiCount[i].count);
         }
@@ -880,6 +908,12 @@ public class WifiMetricsTest {
                 mDecodedProto.numPasspointProviderUninstallSuccess);
         assertEquals(NUM_PASSPOINT_PROVIDERS_SUCCESSFULLY_CONNECTED,
                 mDecodedProto.numPasspointProvidersSuccessfullyConnected);
+        assertEquals(NUM_RADIO_MODE_CHANGE_TO_MCC, mDecodedProto.numRadioModeChangeToMcc);
+        assertEquals(NUM_RADIO_MODE_CHANGE_TO_SCC, mDecodedProto.numRadioModeChangeToScc);
+        assertEquals(NUM_RADIO_MODE_CHANGE_TO_SBS, mDecodedProto.numRadioModeChangeToSbs);
+        assertEquals(NUM_RADIO_MODE_CHANGE_TO_DBS, mDecodedProto.numRadioModeChangeToDbs);
+        assertEquals(NUM_SOFTAP_USER_BAND_PREFERENCE_UNSATISFIED,
+                mDecodedProto.numSoftApUserBandPreferenceUnsatisfied);
 
         PnoScanMetrics pno_metrics = mDecodedProto.pnoScanMetrics;
         assertNotNull(pno_metrics);
@@ -930,6 +964,7 @@ public class WifiMetricsTest {
 
         assertEquals(NUM_WATCHDOG_SUCCESS_DURATION_MS,
                 mDecodedProto.watchdogTriggerToConnectionSuccessDurationMs);
+        assertEquals(IS_MAC_RANDOMIZATION_ON, mDecodedProto.isMacRandomizationOn);
     }
 
     /**
@@ -1299,7 +1334,7 @@ public class WifiMetricsTest {
     private static final int ASSOC_TIMEOUT = 1;
     private static final int LOCAL_GEN = 1;
     private static final int AUTH_FAILURE_REASON = WifiManager.ERROR_AUTH_FAILURE_WRONG_PSWD;
-    private static final int NUM_TEST_STA_EVENTS = 15;
+    private static final int NUM_TEST_STA_EVENTS = 16;
     private static final String   sSSID = "\"SomeTestSsid\"";
     private static final WifiSsid sWifiSsid = WifiSsid.createFromAsciiEncoded(sSSID);
     private static final String   sBSSID = "01:02:03:04:05:06";
@@ -1348,7 +1383,8 @@ public class WifiMetricsTest {
         {StaEvent.TYPE_CONNECT_NETWORK,                 0,                          1},
         {StaEvent.TYPE_NETWORK_AGENT_VALID_NETWORK,     0,                          0},
         {StaEvent.TYPE_FRAMEWORK_DISCONNECT,            StaEvent.DISCONNECT_API,    0},
-        {StaEvent.TYPE_SCORE_BREACH,                    0,                          0}
+        {StaEvent.TYPE_SCORE_BREACH,                    0,                          0},
+        {StaEvent.TYPE_MAC_CHANGE,                      0,                          1}
     };
     // Values used to generate the StaEvent log calls from WifiMonitor
     // <type>, <reason>, <status>, <local_gen>,
@@ -1383,7 +1419,9 @@ public class WifiMetricsTest {
         {StaEvent.TYPE_FRAMEWORK_DISCONNECT,            -1,            -1,         0,
             /**/                               0,             0,        0, 0},    /**/
         {StaEvent.TYPE_SCORE_BREACH,                    -1,            -1,         0,
-            /**/                               0,             0,        0, 0}     /**/
+            /**/                               0,             0,        0, 0},    /**/
+        {StaEvent.TYPE_MAC_CHANGE,                      -1,            -1,         0,
+            /**/                               0,             0,        0, 1}     /**/
     };
 
     /**
@@ -1705,6 +1743,30 @@ public class WifiMetricsTest {
         assertEquals(0, mDecodedProto.numOpenNetworkRecommendationUpdates);
     }
 
+    /**
+     * Check ScoringParams
+     */
+    @Test
+    public void testExperimentId() throws Exception {
+        final int id = 42;
+        final String expectId = "x" + id;
+        when(mScoringParams.getExperimentIdentifier()).thenReturn(id);
+        dumpProtoAndDeserialize();
+        assertEquals(expectId, mDecodedProto.scoreExperimentId);
+    }
+
+    /**
+     * Check ScoringParams default case
+     */
+    @Test
+    public void testDefaultExperimentId() throws Exception {
+        final int id = 0;
+        final String expectId = "";
+        when(mScoringParams.getExperimentIdentifier()).thenReturn(id);
+        dumpProtoAndDeserialize();
+        assertEquals(expectId, mDecodedProto.scoreExperimentId);
+    }
+
     /** short hand for instantiating an anonymous int array, instead of 'new int[]{a1, a2, ...}' */
     private int[] a(int... element) {
         return element;
@@ -1759,7 +1821,7 @@ public class WifiMetricsTest {
         if (!dontDeserializeBeforePoll) {
             dumpProtoAndDeserialize();
         }
-        mWifiMetrics.incrementRssiPollRssiCount(scanRssi + rssiDelta);
+        mWifiMetrics.incrementRssiPollRssiCount(RSSI_POLL_FREQUENCY, scanRssi + rssiDelta);
     }
 
     /**
