@@ -2347,7 +2347,7 @@ public class WifiServiceImpl extends IWifiManager.Stub {
         enforceConnectivityInternalPermission();
         mLog.info("setCountryCode uid=%").c(Binder.getCallingUid()).flush();
         final long token = Binder.clearCallingIdentity();
-        mCountryCode.setCountryCode("VE");
+        mCountryCode.setCountryCode(countryCode);
         Binder.restoreCallingIdentity(token);
     }
 
