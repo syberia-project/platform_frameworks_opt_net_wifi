@@ -811,8 +811,7 @@ public class ClientModeImpl extends StateMachine {
 
         mWifiScoreReport = new WifiScoreReport(mWifiInjector.getScoringParams(), mClock,
                 mWifiMetrics, mWifiInfo, mWifiNative, mBssidBlocklistMonitor,
-                mWifiInjector.getWifiThreadRunner(), mWifiInjector.getDeviceConfigFacade(),
-                mContext);
+                mWifiInjector.getWifiThreadRunner());
 
         mNetworkCapabilitiesFilter = new NetworkCapabilities.Builder()
                 .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
